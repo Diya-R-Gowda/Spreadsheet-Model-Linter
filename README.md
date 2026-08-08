@@ -8,7 +8,11 @@ Runs entirely offline, on commodity hardware, at zero cost — no API keys, no c
 
 ## Status
 
-**Week 1 (parsing spine) is done.** The workbook parser and `ssmlint dump` CLI exist and are tested. Everything past that — R1C1 normalization, dependency graph, block detection, rule engine, semantic layer — is not built yet.
+**Week 1 (parsing spine) is done.** The workbook parser and `ssmlint dump` CLI exist and are tested.
+
+**Formula tokenizer/AST (stage [2]) is done.** `src/ssmlint/tokenizer.py` and `src/ssmlint/formula_parser.py` turn a raw formula string into a structured AST — hand-rolled, no third-party formula-parsing library — with correct operator precedence (including Excel's unary-minus-before-`^` quirk), $-anchoring per axis, cross-sheet references, and named ranges. It's standalone: not yet wired into `parser.py`. Formula shapes outside the v1 whitelist (array formulas, `LET`/`LAMBDA`, structured table references, full-column/full-row and 3-D ranges, the percent operator) raise `UnsupportedFormulaError` rather than crashing or mis-parsing.
+
+Everything past that — R1C1 normalization, dependency graph, block detection, rule engine, semantic layer — is not built yet.
 
 ## Usage
 
