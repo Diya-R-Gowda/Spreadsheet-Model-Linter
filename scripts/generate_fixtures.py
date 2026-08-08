@@ -115,6 +115,55 @@ def build_skip_cases() -> openpyxl.Workbook:
     return wb
 
 
+REVENUE_MONTHS = [
+    "Jan-24", "Feb-24", "Mar-24", "Apr-24", "May-24", "Jun-24",
+    "Jul-24", "Aug-24", "Sep-24", "Oct-24", "Nov-24", "Dec-24",
+]
+
+
+def build_revenue_row_with_hardcode() -> openpyxl.Workbook:
+    """The README's own C14:N14 example: a 12-month revenue row (row 14)
+    with an identical growth formula in every column except H14, which is
+    a hardcoded literal breaking the pattern in the middle of the row.
+
+    Row 13 holds month headers, row 14 the revenue formula chain (seeded
+    from B14), row 15 a flat growth-rate driver each formula reads from.
+    Column range is B (seed) through M (12 formula columns after the
+    seed), i.e. the formula run lives in C14:M14 with H14 (the 6th
+    formula column) hardcoded — deliberately mirroring the README's
+    "H14 hardcoded while neighbors are formulas" framing without needing
+    exactly 14 columns to land on letter N.
+    """
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Model"
+
+    ws["A13"] = "Line Item"
+    for i, month in enumerate(REVENUE_MONTHS):
+        ws.cell(row=13, column=2 + i, value=month)
+
+    ws["A14"] = "Revenue"
+    ws["B14"] = 100000
+    ws["B14"].number_format = "#,##0"
+
+    ws["A15"] = "Growth Rate"
+    for col_idx in range(2, 2 + len(REVENUE_MONTHS)):
+        letter = get_column_letter(col_idx)
+        ws[f"{letter}15"] = 0.05
+
+    for col_idx in range(3, 2 + len(REVENUE_MONTHS)):
+        prev_letter = get_column_letter(col_idx - 1)
+        this_letter = get_column_letter(col_idx)
+        cell = ws[f"{this_letter}14"]
+        if this_letter == "H":
+            cell.value = 4500000  # hardcoded — breaks the pattern, on purpose
+        else:
+            cell.value = f"={prev_letter}14*(1+{prev_letter}15)"
+        cell.number_format = "#,##0"
+
+    return wb
+
+
 def build_circular_reference() -> openpyxl.Workbook:
     """A direct two-cell circular reference: A1 depends on B1, B1 depends on A1."""
     wb = openpyxl.Workbook()
@@ -153,6 +202,7 @@ def main() -> None:
     build_skip_cases().save(FIXTURES_DIR / "skip_cases.xlsx")
     build_circular_reference().save(FIXTURES_DIR / "circular_reference.xlsx")
     build_blank_reference().save(FIXTURES_DIR / "blank_reference.xlsx")
+    build_revenue_row_with_hardcode().save(FIXTURES_DIR / "revenue_row_with_hardcode.xlsx")
     print(f"Wrote fixtures to {FIXTURES_DIR}")
 
 

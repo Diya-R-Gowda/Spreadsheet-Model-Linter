@@ -29,6 +29,7 @@ src/ssmlint/
   r1c1.py                # [3] position-independent formula normalization
   errors.py                # shared FormulaError hierarchy
   depgraph.py               # [4] workbook-wide precedent/dependent DAG
+  blocks.py                  # [5] row-wise block clustering + near-miss detection
 scripts/generate_fixtures.py   # builds synthetic .xlsx test fixtures
 tests/                          # pytest suite; fixtures regenerated per session, not committed
 ```
@@ -55,7 +56,7 @@ Nine-stage pipeline, each stage consuming the previous stage's output:
 [4] Dependency Graph ────────► DAG of cell → precedents/dependents          🟢
    │                            (networkx)
    ▼
-[5] Block Detector ──────────► contiguous regions with shared structure    🔴
+[5] Block Detector ──────────► contiguous regions with shared structure    🟢
    │                            (R1C1 equality + rapidfuzz for near-misses)
    ▼
 [6] Rule Engine (Tier 0) ────► deterministic checks, always on, $0         🔴
@@ -84,7 +85,7 @@ Nine-stage pipeline, each stage consuming the previous stage's output:
 | Formula AST | hand-rolled tokenizer/parser | Full control, no third-party formula-parsing dependency |
 | R1C1 normalization | hand-rolled | Core transformation of the project |
 | Graph | `networkx` | Cycle detection, topological ordering |
-| Clustering | R1C1 equality + `rapidfuzz` (planned) | Exact match covers most; fuzzy catches near-misses |
+| Clustering | R1C1 equality + `rapidfuzz` | Exact match covers most; fuzzy catches near-misses |
 | Semantic layer — Tier 1 (planned) | DeBERTa-v3-small / ModernBERT-base, fine-tuned on synthetic-corruption labels | CPU-only, ms/block, $0 |
 | Semantic layer — Tier 2 (planned, optional) | Local 3B model via Ollama (Qwen2.5-3B-Instruct or Phi-3-mini) | Fits in 16GB RAM; 7B+ excluded for latency reasons |
 | Report | Jinja2 → single-file HTML (planned) | Must open without a server |
@@ -147,12 +148,20 @@ The README's original Build Plan bundled "R1C1 normalization + dependency graph"
 
 | Task | Status | Detail |
 |---|:---:|---|
-| Block detector | 🔴 | Not started. Will cluster contiguous cells by normalized (R1C1) formula using exact string equality plus `rapidfuzz` for near-misses. |
+| Block detector (`blocks.py`) | 🟢 | Clusters each sheet's rows into blocks of contiguous cells sharing one exact R1C1 pattern (row-wise only — see "how it was solved"). A gap of even one non-conforming cell ends a block; nothing is ever merged across it. For each block, the immediate left/right neighbor is classified as either `non_conforming` (blank, literal, unparseable, or a formula scoring below the near-miss threshold) or `near_miss` (a different-but-similar formula, via `rapidfuzz.fuzz.ratio`, with its score attached). Minimum block size is 3 cells. |
 | Rule engine — literal-in-formula-block | 🔴 | Not started. Flags a hardcoded value sitting inside an otherwise-formula-driven row/column block. |
 | Rule engine — range boundary mismatch | 🔴 | Not started. Flags off-by-one errors in range references (e.g. a `SUM` that excludes the last row of a block). |
 | Rule engine — reference to blank | 🔴 | Not started. Flags formulas referencing genuinely empty cells. |
 | Rule engine — inconsistent anchoring | 🔴 | Not started. Flags `$`-anchoring that breaks the pattern established by the rest of a block. |
 | Synthetic-corruption corpus (build now, not later) | 🔴 | Not started. 50 clean models with programmatically injected known bugs — the evaluation *and* future classifier-training backbone. |
+
+**Block detector — how it was solved:** Clusters along rows only, not columns — the README's own worked example (`C14:N14`, a revenue row with a month per column) is row-wise, and it's the documented primary shape for these models; column-wise clustering was deliberately left out of scope for this stage rather than half-built. Two judgment calls without a derivable "correct" answer were made explicit rather than picked silently: **minimum block size = 3** (2 adjacent same-pattern cells is weak evidence of an intentional pattern — could easily be coincidence — while 3+ is a much stronger signal), flagged in the delivery summary; and the **rapidfuzz near-miss threshold = 85** (`fuzz.ratio`, character-level and order-sensitive — deliberately not `token_sort_ratio`, which would wrongly call `R[0]C[-1]-R[0]C[-2]` and `R[0]C[-2]-R[0]C[-1]` identical when they mean different things), which was raised as a direct question rather than folded into the summary, per instruction that a second judgment call this significant should be asked, not assumed. Blank-cell detection defers to `DependencyGraph.is_empty()` when the neighbor is a graph node, reusing `depgraph.py`'s single already-documented definition of "empty" instead of re-deriving it a third time; cells that never became graph nodes (unreferenced literals) fall back to deriving it straight from the `CellRecord`. Verified by printing actual block spans/patterns/deviations (not just pass/fail) for every required scenario — a clean row block, a gap producing two separate blocks, a literal in the middle of what would've been one run, a near-miss with its real computed score (92.59 for a `+1` tacked onto an otherwise-identical formula, 46.34 for a genuinely unrelated one), and the N-1-vs-N minimum-size boundary — plus the full 12-column README-style revenue row fixture (`revenue_row_with_hardcode.xlsx`), which split cleanly into `C14:G14` and `I14:M14` around the hardcoded `H14`, with `H14` correctly reported as a non-conforming neighbor of *both* blocks.
+
+**Block detector — bugs/defects encountered and fixed:** None in the implementation itself. While writing the test suite, three of my own test assertions had hand-computed R1C1 pattern strings with row/column offsets transposed (e.g. asserting `R[-1]C[0]` where the module actually and correctly produces `R[0]C[-1]`) — caught immediately by cross-checking against `r1c1.normalize()`'s real output before trusting the assertion, per the standard set during the R1C1 stage of verifying actual values rather than assuming derivations. Two other early test assertions asserted a block's `non_conforming` list was empty without accounting for a seed literal cell (`B14`) that was always present as that block's left neighbor in the test data — a test-data oversight, not a code bug; fixed by removing the irrelevant seed cell from those two tests so they isolate the one behavior each was meant to check.
+
+**Known limitation carried into this stage from `r1c1.py`:** a formula that explicitly spells out its own sheet name (`=Sheet1!B14*C14` while living on `Sheet1`) normalizes differently from the equivalent implicit form (`=B14*C14`) — see Week 2's write-up. This module inherits that unchanged: such a formula sitting next to otherwise-identical implicit-sheet formulas in a row would be seen as a pattern break here, potentially splitting a block that should be one. No fixture in this stage exercises self-sheet-qualified references, so it hasn't been observed in practice, but it's a real inherited edge case, documented in `blocks.py`'s own module docstring rather than silently worked around (which would mean duplicating origin-sheet-aware logic `r1c1.py` deliberately doesn't have).
+
+**Known limitation, new to this stage:** a cell that fails so catastrophically in `parser.py`'s per-cell catch-all that it never gets a `CellRecord` at all (only an entry in `ParsedWorkbook.skipped`, plus a bare node in the dependency graph) is invisible to this module's row grouping, since `blocks.py` walks `ParsedWorkbook.sheets[*].cells` directly. Such a cell could never be reported as a block's non-conforming neighbor even though the graph knows about it. Judged acceptable — this requires an `openpyxl` per-cell read to fail outright, which essentially never happens in practice — and documented in `blocks.py`'s module docstring rather than silently patched around with graph-splicing logic no fixture or test currently needs.
 
 ---
 
