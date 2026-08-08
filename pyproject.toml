@@ -9,6 +9,7 @@ description = "Static analysis for financial models in .xlsx files"
 requires-python = ">=3.10"
 dependencies = [
     "openpyxl>=3.1",
+    "networkx>=3.0",
 ]
 
 [project.optional-dependencies]

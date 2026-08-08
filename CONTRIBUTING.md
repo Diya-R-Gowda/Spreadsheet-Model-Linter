@@ -26,7 +26,9 @@ src/ssmlint/
   tokenizer.py         # [2] formula lexer
   formula_parser.py    # [2] formula AST builder
   ast_nodes.py          # [2] AST node dataclasses
-  errors.py              # shared FormulaError hierarchy
+  r1c1.py                # [3] position-independent formula normalization
+  errors.py                # shared FormulaError hierarchy
+  depgraph.py               # [4] workbook-wide precedent/dependent DAG
 scripts/generate_fixtures.py   # builds synthetic .xlsx test fixtures
 tests/                          # pytest suite; fixtures regenerated per session, not committed
 ```
@@ -50,7 +52,7 @@ Nine-stage pipeline, each stage consuming the previous stage's output:
 [3] R1C1 Normalizer ─────────► relative formulas → position-independent    🟢
    │                            strings (the heart of the project)
    ▼
-[4] Dependency Graph ────────► DAG of cell → precedents/dependents          🔴
+[4] Dependency Graph ────────► DAG of cell → precedents/dependents          🟢
    │                            (networkx)
    ▼
 [5] Block Detector ──────────► contiguous regions with shared structure    🔴
@@ -81,7 +83,7 @@ Nine-stage pipeline, each stage consuming the previous stage's output:
 | Parsing | `openpyxl` | Only mature lib exposing raw formulas |
 | Formula AST | hand-rolled tokenizer/parser | Full control, no third-party formula-parsing dependency |
 | R1C1 normalization | hand-rolled | Core transformation of the project |
-| Graph | `networkx` (planned) | Cycle detection, topological ordering |
+| Graph | `networkx` | Cycle detection, topological ordering |
 | Clustering | R1C1 equality + `rapidfuzz` (planned) | Exact match covers most; fuzzy catches near-misses |
 | Semantic layer — Tier 1 (planned) | DeBERTa-v3-small / ModernBERT-base, fine-tuned on synthetic-corruption labels | CPU-only, ms/block, $0 |
 | Semantic layer — Tier 2 (planned, optional) | Local 3B model via Ollama (Qwen2.5-3B-Instruct or Phi-3-mini) | Fits in 16GB RAM; 7B+ excluded for latency reasons |
@@ -120,7 +122,7 @@ The README's original Build Plan bundled "R1C1 normalization + dependency graph"
 | Whitelist enforcement | 🟢 | Array formulas, `LET`/`LAMBDA`, structured table references, full-column/full-row ranges (`A:A`, `1:1`, including `$`-anchored forms like `$A:$B`), 3-D sheet ranges, and the percent operator all raise `UnsupportedFormulaError` cleanly. Genuinely malformed input raises a separate `FormulaSyntaxError`. Both share a common `FormulaError` base so callers can catch broadly or narrowly. |
 | Standalone/independently testable | 🟢 | Not wired into `parser.py` yet, by design — this stage is testable in isolation before the pipeline commits to using it. |
 | R1C1 Normalizer (`r1c1.py`) | 🟢 | Converts a formula's AST plus its origin cell address into a position-independent R1C1-style string. Each `CellRef` axis becomes a bracketed relative offset (`R[1]C[-1]`) if unanchored, or an unbracketed absolute position (`R14C2`) if `$`-anchored — independently per axis, so `$B14` and `B$14` normalize differently from each other and from `B14`. `RangeRef` normalizes both endpoints; cross-sheet refs get a `Sheet!` prefix kept structurally separate from the offset part; `NamedRangeRef` passes through unresolved (case preserved — unlike function names, named ranges are case-sensitive in Excel); function names are upper-cased; every `BinaryOp`/`UnaryOp` is explicitly parenthesized in the output so structurally different ASTs can never coincidentally flatten to the same string. |
-| Dependency Graph | 🔴 | Not started. Will build a `networkx` DAG of cell → precedents/dependents from the AST's `CellRef`/`RangeRef` nodes, enabling cycle detection and topological ordering. |
+| Dependency Graph (`depgraph.py`) | 🟢 | Workbook-wide `networkx.DiGraph` where nodes are sheet-qualified addresses and an edge `precedent -> dependent` means "dependent's formula reads from precedent" — chosen specifically so `topological_sort()` doubles as a valid calculation order with no reversal. Walks every formula's AST, expands `RangeRef`s to individual cell edges (a `SUM(B4:B10)` is 7 edges, never one range-shaped edge), resolves `NamedRangeRef`s against `parser.py`'s captured named ranges (sheet-scoped names shadow workbook-scoped ones, matching Excel), and cross-sheet refs become ordinary edges into the target sheet. `precedents()`/`dependents()`/`find_cycles()`/`topological_order()` query methods; the last raises a dedicated `CyclicDependencyError` (carrying the offending cycles) instead of leaking networkx's own exception. Every node also carries an `empty` attribute (computed once, not re-derived per query) and a `parse_error` attribute so cells with unparseable or catastrophically-failed formulas still exist as nodes with no outgoing edges rather than vanishing. |
 
 **Formula tokenizer/parser — how it was solved:** The lexer uses one big alternation-based regex tried in a fixed order (multi-char operators like `<=` before their single-char prefixes; sheet-prefix and cell-address patterns before the generic identifier pattern, since identifiers would otherwise swallow them whole). The parser is a standard precedence-climbing recursive descent, with one deliberate deviation from "normal" language grammars: Excel evaluates `-2^2` as `4`, not `-4` — unary minus binds *tighter* than `^`, the opposite of Python/most languages — so `unary` sits *below* `power` in the grammar instead of wrapping it. `^` itself is left-associative in Excel (`2^3^2 = 64`, not `512`), confirmed with dedicated tests. A small literal-only AST evaluator was written in the test suite specifically to pin down these precedence/associativity cases numerically rather than just asserting tree shape.
 
@@ -134,6 +136,10 @@ The README's original Build Plan bundled "R1C1 normalization + dependency graph"
 1. **Test suite asserted the wrong expected value for named ranges.** Two tests initially expected `TaxRate` to normalize to `TAXRATE` (upper-cased, mirroring the function-name rule), and failed. Root cause was the test's assumption, not the implementation: Excel function names are case-insensitive but named-range names are case-sensitive, and `r1c1.py` already preserved the original case correctly per spec ("passes through as the name itself"). Fixed by correcting the two test expectations (`test_named_range_passes_through_unresolved`, `test_sheet_scoped_named_range_is_prefixed`) to preserve case rather than changing the implementation.
 
 **Known, documented limitation (not a bug):** a formula that explicitly writes its own sheet name (e.g. `=Sheet1!B14*C14` while physically living on `Sheet1`) is treated as cross-sheet and will *not* normalize identically to the equivalent implicit form `=B14*C14`, because `normalize()`'s API deliberately doesn't take the origin's sheet name as an argument (only its row/column). Fixing this would require widening the public API; documented in `r1c1.py`'s module docstring rather than silently mishandled.
+
+**Dependency graph — how it was solved:** Two design decisions did most of the work. First, the edge direction (`precedent -> dependent`) was picked specifically so `networkx.topological_sort()` needs no reversal to produce a valid Excel calculation order, and so `precedents(cell)`/`dependents(cell)` map directly onto `predecessors()`/`successors()` with no adapter logic. Second, rather than trusting `parser.py`'s own `skipped` log to decide which cells get no outgoing edges, this module re-parses every formula itself with `formula_parser.parse_formula()` — the two layers don't always agree (see the array-formula case below), so re-parsing is the more accurate source of truth. Named-range resolution reuses `formula_parser.parse_formula()` a second time, on the named range's own `refers_to` text, instead of writing a second reference-parsing grammar. The "is this cell empty" question was deliberately made a node attribute computed once at build time rather than a live lookup against `ParsedWorkbook`, since the rule engine (next stage) will ask it repeatedly per edge and the answer can never change after the graph is built. Verified with hand-built `ParsedWorkbook` objects for the cases a real `.xlsx` can't easily produce (circular refs, dangling named ranges, a cell that never got a `CellRecord` at all), plus real-fixture integration tests, plus manual spot-checks beyond the test suite (self-loops, 3-node cycles, duplicate refs in one formula, reversed ranges like `B10:B4`, and a formula combining a range + a named range + a cross-sheet ref in one expression) — all matched expectations with no further bugs found.
+
+**Dependency graph — bugs/defects encountered and fixed:** None. Every hand-built test case, every fixture integration test, and every manual spot-check (including several scenarios beyond the required edge cases — self-loops, 3-node cycles, duplicate same-cell references, reversed range bounds) passed on first implementation.
 
 ---
 

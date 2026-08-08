@@ -115,12 +115,44 @@ def build_skip_cases() -> openpyxl.Workbook:
     return wb
 
 
+def build_circular_reference() -> openpyxl.Workbook:
+    """A direct two-cell circular reference: A1 depends on B1, B1 depends on A1."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Circular"
+
+    ws["A1"] = "=B1+1"
+    ws["B1"] = "=A1+1"
+
+    return wb
+
+
+def build_blank_reference() -> openpyxl.Workbook:
+    """A formula referencing a genuinely blank cell within the sheet's used range.
+
+    D1 is set purely to widen the sheet's used range so C1 — never
+    written to — still shows up as a real (blank) cell when iterated,
+    rather than simply falling outside the workbook's dimensions.
+    """
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Blank Refs"
+
+    ws["A1"] = 10
+    ws["B1"] = "=A1+C1"  # C1 is intentionally never written to
+    ws["D1"] = "marker"
+
+    return wb
+
+
 def main() -> None:
     FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
     build_clean_model().save(FIXTURES_DIR / "clean_model.xlsx")
     build_merged_cells().save(FIXTURES_DIR / "merged_cells.xlsx")
     build_named_range_cross_sheet().save(FIXTURES_DIR / "named_range_cross_sheet.xlsx")
     build_skip_cases().save(FIXTURES_DIR / "skip_cases.xlsx")
+    build_circular_reference().save(FIXTURES_DIR / "circular_reference.xlsx")
+    build_blank_reference().save(FIXTURES_DIR / "blank_reference.xlsx")
     print(f"Wrote fixtures to {FIXTURES_DIR}")
 
 
