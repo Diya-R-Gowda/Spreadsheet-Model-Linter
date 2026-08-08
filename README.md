@@ -2,6 +2,8 @@
 
 **Static analysis for financial models. Finds errors in .xlsx files the way a linter finds bugs in code.**
 
+Runs entirely offline, on commodity hardware, at zero cost — no API keys, no cloud dependency. That's a deliberate design choice, not a limitation worked around: financial models are exactly the files organizations won't send to a third-party API.
+
 ---
 
 ## The Problem
@@ -10,13 +12,13 @@ Financial models run companies, and they are catastrophically error-prone. Studi
 
 Nobody lints spreadsheets. The tooling that exists is either enterprise-priced audit software or trivial "find hardcoded cells" macros. Meanwhile every LLM spreadsheet project built in the last two years is "chat with your CSV" — a natural language query layer, which is a solved and commoditized problem.
 
-This project inverts it: the LLM never answers questions about the data. It reconstructs *intent* from structure, and flags cells that violate that intent.
+This project inverts it: instead of answering questions about data, it reconstructs *intent* from structure and flags cells that violate that intent — using static analysis techniques (tokenization, normalization, dependency graphs, clustering) that are the actual engineering substance of the project. A learned semantic layer is a bonus tier on top, not the point.
 
 ## The Core Insight
 
 A spreadsheet has an implicit contract that is never written down. If row 14 is "Revenue" and columns C through N are months, then `C14:N14` should all contain structurally identical formulas. If `H14` is a hardcoded `4500000` while its neighbors are `=G14*(1+G15)`, that is a bug — someone plugged a number to make a total tie out and never removed it.
 
-You cannot detect this with rules alone, because the definition of "structurally identical" depends on what the block *means*. `=SUM(...)` breaking a pattern is fine in a subtotal row and wrong in a driver row. That semantic judgment is where the LLM earns its place — and only there.
+Deterministic rules alone catch a lot of this, but not all of it: the definition of "structurally identical" depends on what the block *means*. `=SUM(...)` breaking a pattern is fine in a subtotal row and wrong in a driver row. That judgment call is where a semantic layer — a trained classifier, or a small local model — earns its place, on top of a rule engine that already does most of the work deterministically.
 
 ---
 
@@ -26,18 +28,22 @@ You cannot detect this with rules alone, because the definition of "structurally
 - `.xlsx` / `.xlsm` input, single workbook, multiple sheets
 - Detection of: hardcoded values inside formula ranges, inconsistent formulas across a row/column block, off-by-one range errors, references to empty cells, circular-ish logic, sign convention breaks, unit/scale mismatches (thousands vs millions)
 - Output: a ranked issue report (JSON + HTML) with cell address, severity, explanation, and suggested fix
+- Fully offline execution — no network calls required for the default configuration
 
 **Explicitly out of scope**
 - Editing or repairing the workbook (report only — do not touch someone's model)
 - Google Sheets, .xls (legacy binary), CSV
 - Charts, pivot tables, macros, external workbook links
 - Anything requiring the workbook to be recalculated
+- Any hosted/paid API as a required dependency (optional, never required)
 
 Keeping repair out of scope is not laziness. It halves the trust burden and removes an entire class of destructive failure.
 
 ---
 
 ## Architecture
+
+The semantic layer is tiered, each tier independently measurable and each one optional relative to the one below it:
 
 ```
 .xlsx file
@@ -47,27 +53,38 @@ Keeping repair out of scope is not laziness. It halves the trust burden and remo
    │                            (openpyxl, data_only=False)
    ▼
 [2] Formula Tokenizer ───────► AST per formula
-   │                            (functions, refs, literals, operators)
+   │                            (hand-rolled: predictable, full control)
    ▼
-[3] Dependency Graph ────────► DAG of cell → precedents/dependents
+[3] R1C1 Normalizer ─────────► relative formulas → position-independent strings
+   │                            (the heart of the project)
+   ▼
+[4] Dependency Graph ────────► DAG of cell → precedents/dependents
    │                            (networkx)
    ▼
-[4] Block Detector ──────────► contiguous regions with shared structure
-   │                            (formula R1C1 normalization + clustering)
+[5] Block Detector ──────────► contiguous regions with shared structure
+   │                            (R1C1 equality + rapidfuzz for near-misses)
    ▼
-[5] Rule Engine ─────────────► deterministic checks, high precision
-   │                            (no LLM — catches ~60% of issues)
+[6] Rule Engine (Tier 0) ────► deterministic checks — always on, $0, ms/workbook
+   │                            high precision, catches most issues on its own
    ▼
-[6] LLM Semantic Layer ──────► block intent + anomaly judgment
-   │                            (only on blocks the rule engine flags
-   │                             as ambiguous, plus a sampled sweep)
+[7] Trained Classifier (Tier 1, optional) ─► subtotal | intentional_override |
+   │    suspected_error | unknown            suspected_error | unknown
+   │                            small encoder (DeBERTa-v3-small / ModernBERT-base)
+   │                            trained on your own synthetic-corruption labels
+   │                            CPU-only, ms/block, $0
    ▼
-[7] Report Builder ──────────► ranked JSON + standalone HTML
+[8] Local LLM Adjudicator (Tier 2, optional, flag-gated) ─► same 4-way label
+   │                            3B model via Ollama (Qwen2.5-3B / Phi-3-mini)
+   │                            grammar-constrained output, cached by block signature
+   │                            $0, seconds/block — use sparingly
+   ▼
+[9] Report Builder ──────────► ranked JSON + standalone HTML,
+                                tagged with which tier flagged each issue
 ```
 
 ### The critical design decision
 
-**The LLM sees normalized structure, never raw cell dumps.** Do not paste a sheet into a prompt. Instead, send a compact block description:
+**Any semantic layer sees normalized structure, never raw cell dumps.** Whether it's a trained classifier or a local LLM, send a compact block description, not a pasted sheet:
 
 ```json
 {
@@ -83,7 +100,7 @@ Keeping repair out of scope is not laziness. It halves the trust burden and remo
 }
 ```
 
-This makes the token cost independent of workbook size, keeps the model focused on judgment rather than extraction, and makes results reproducible.
+This keeps input size independent of workbook size, keeps the model/classifier focused on judgment rather than extraction, and makes results reproducible. It also means the same block representation feeds Tier 1 and Tier 2 interchangeably, which is what makes the ablation comparison clean.
 
 ---
 
@@ -92,12 +109,16 @@ This makes the token cost independent of workbook size, keeps the model focused 
 | Layer | Choice | Why |
 |---|---|---|
 | Parsing | `openpyxl` | Only mature lib exposing raw formulas |
-| Formula AST | `formulas` or hand-rolled tokenizer | `formulas` is fuller; hand-rolling is more predictable |
+| Formula AST | hand-rolled tokenizer | Full control, predictable, reinforces the static-analysis framing |
+| R1C1 normalization | hand-rolled | Core transformation of the project |
 | Graph | `networkx` | Cycle detection, topological ordering |
 | Clustering | R1C1 string equality + `rapidfuzz` | Exact match covers most; fuzzy catches near-misses |
-| LLM | Any frontier model, temperature 0 | Judgment layer only |
+| Semantic layer — Tier 1 (default) | Small encoder classifier: DeBERTa-v3-small or ModernBERT-base, fine-tuned on synthetic-corruption labels | CPU-only, ms/block, $0; likely beats a general-purpose model on this narrow closed-label task since it's trained on your own data |
+| Semantic layer — Tier 2 (optional) | Local 3B model via Ollama (Qwen2.5-3B-Instruct or Phi-3-mini), structured/grammar-constrained output | Fits comfortably in 16GB RAM; 7B is deliberately excluded — memory-bandwidth-bound on this hardware class, impractical latency (~an hour per workbook at 200 ambiguous blocks) |
 | Report | Jinja2 → single-file HTML | Must open without a server |
 | Tests | `pytest` + fixture workbooks | Build a corrupted-workbook corpus |
+
+**Hardware note:** developed and tuned against a 13th-gen Intel i5-1335U (15W, 2P+8E cores, no dedicated VRAM) with 16GB RAM. This class of machine is memory-bandwidth-bound, not compute-bound — it rules out 7B+ local models for interactive use but comfortably runs both the Tier 1 classifier and a Tier 2 3B model. The project should run on this hardware as the baseline target, not as a fallback.
 
 ---
 
@@ -108,7 +129,7 @@ You need real models, not toy files.
 1. **SEC EDGAR full-text search** — filter for `.xlsx` exhibits. Public company filings sometimes include supporting models.
 2. **University finance course materials** — LBO/DCF templates are widely posted and realistically messy.
 3. **Kaggle / GitHub** — search `filetype:xlsx` for budget, forecast, and model templates.
-4. **Synthetic corruption (your evaluation backbone)** — take 50 clean models, programmatically inject known bugs (replace a formula with its computed value, shift a range by one, flip a sign). You now have perfect ground truth.
+4. **Synthetic corruption (your evaluation *and* training backbone)** — take 50 clean models, programmatically inject known bugs (replace a formula with its computed value, shift a range by one, flip a sign). This gives you perfect ground truth for evaluation *and* labeled training data for the Tier 1 classifier — the same pipeline serves both purposes.
 
 The synthetic corpus is what makes this project rigorous. Everything else is anecdote.
 
@@ -120,24 +141,32 @@ The synthetic corpus is what makes this project rigorous. Everything else is ane
 
 **Week 2 — Dependency graph + R1C1 normalization.** Convert A1 formulas to relative R1C1 so `=B4*C4` in row 4 and `=B5*C5` in row 5 become the same string. This single transformation is the heart of the project.
 
-**Week 3 — Block detection + rule engine.** Cluster contiguous cells by normalized formula. Implement deterministic rules: literal-in-formula-block, range boundary mismatch, reference to blank, inconsistent anchoring (`$`).
+**Week 3 — Block detection + rule engine.** Cluster contiguous cells by normalized formula. Implement deterministic rules: literal-in-formula-block, range boundary mismatch, reference to blank, inconsistent anchoring (`$`). Build the synthetic-corruption corpus now, not later.
 
-**Week 4 — LLM semantic layer.** Prompt design, block summarization, intent inference. Add severity scoring. Cache aggressively — same block, same verdict.
+**Week 4 — Baseline evaluation (Tier 0 only).** Run the rule engine alone against the synthetic corpus. Measure precision/recall/precision@10 per bug class. This is a real, publishable result on its own — don't skip straight past it.
 
-**Week 5 — Evaluation harness.** Run against the synthetic corpus. Compute precision/recall per bug class. This week will tell you your rule engine is over-firing; fix it.
+**Week 5 — Trained classifier (Tier 1).** Use the synthetic-corruption labels to train a small encoder classifier on ambiguous blocks. Measure again on the same corpus. This is the Tier 0 → Tier 0+1 comparison.
 
-**Week 6 — Report UI + polish.** HTML report with a sheet heatmap, click-through to cells, and severity filtering. Write up findings.
+**Week 6 — Optional local LLM (Tier 2) + ablation table + report UI.** Add the flag-gated 3B local model as a third configuration if time allows. Publish the full ablation table (precision, recall, precision@10, cost, runtime, per tier). Build the HTML report with a sheet heatmap, click-through to cells, severity filtering, and a tag showing which tier flagged each issue.
 
 ---
 
 ## Evaluation
 
-Track these, per bug class, on the synthetic corpus:
+The headline deliverable is an **ablation table**, not a single precision/recall number:
 
-- **Precision** — of flagged cells, what fraction are injected bugs? *Target > 0.85.* This matters far more than recall. An auditor who gets 40 false alarms stops using the tool permanently.
-- **Recall** — of injected bugs, what fraction were caught? *Target > 0.70.*
-- **Ranking quality** — is the true bug in the top 10 flags? Report precision@10.
-- **Cost and latency per workbook** — should be under a few cents and under 30 seconds.
+| Configuration | Precision | Recall | Precision@10 | Cost | Median runtime/workbook |
+|---|---|---|---|---|---|
+| Tier 0 (rules only) | target > 0.85 | — | — | $0 | — |
+| Tier 0 + 1 (+ trained classifier) | — | should rise vs. Tier 0 | — | $0 | — |
+| Tier 0 + 1 + 2 (+ local LLM) | — | should rise further | — | $0 | — |
+
+Expectation going in, to be confirmed by measurement rather than assumed: rules-only should skew toward **high precision, lower recall** (deterministic rules only fire when certain), and each added tier should trade some precision for recall. Do not treat the ~60/40 split from earlier drafts of this plan as a measured fact — it wasn't; measure it.
+
+- **Precision** matters more than recall. An auditor who gets 40 false alarms stops using the tool permanently.
+- **Recall** — of injected bugs, what fraction were caught, per tier.
+- **Ranking quality** — is the true bug in the top 10 flags? Report precision@10, per tier.
+- **Cost and latency per workbook** — cost is $0 across all tiers by construction; report latency per tier since that's the real constraint on this hardware, not money.
 
 Also run against clean, uncorrupted models and count flags. Every flag there is a false positive on a real file. This number is your credibility.
 
@@ -148,22 +177,26 @@ Also run against clean, uncorrupted models and count flags. Every flag there is 
 | Risk | Reality | Mitigation |
 |---|---|---|
 | Formula parsing eats the schedule | Excel's grammar has array formulas, structured table refs, `LET`/`LAMBDA`, locale-dependent separators | Whitelist a formula subset in v1; skip and log what you can't parse |
-| False positive flood | Real models legitimately break patterns constantly | Rule engine must be conservative; require LLM confirmation before surfacing |
-| LLM hallucinating cell addresses | It will invent `H15` when it means `H14` | Never let the model emit addresses — it selects from a provided list |
-| Huge workbooks | 50-sheet, 500k-cell models exist | Stream sheet by sheet; cap LLM calls per workbook |
-| "Is this even a bug?" | Sometimes a hardcode is intentional | Add a severity tier for "intentional-looking overrides" rather than calling everything an error |
+| False positive flood | Real models legitimately break patterns constantly | Rule engine must be conservative; a weak local model producing overconfident judgments on ambiguous blocks is exactly how this happens at Tier 2 — constrain it to closed-label classification, never open-ended judgment |
+| Model hallucinating cell addresses | Any generative model will invent `H15` when it means `H14` | Never let a model emit addresses — it selects from a provided list |
+| Local model latency | A 3B model doing open-ended reasoning per block is seconds each; 200 ambiguous blocks/workbook adds up fast | Narrow Tier 2 to closed 4-way classification, not generation; cache by normalized block signature; cap calls per workbook via rule-engine-ranked triage |
+| 7B+ local models | Memory-bandwidth-bound on U-series/shared-memory hardware; impractical latency for interactive use | Excluded by design — 3B is the ceiling for Tier 2 on the target hardware class |
+| Huge workbooks | 50-sheet, 500k-cell models exist | Stream sheet by sheet; cap classifier/LLM calls per workbook |
+| "Is this even a bug?" | Sometimes a hardcode is intentional | `intentional_override` is a first-class label at Tier 1/2, not lumped in with errors |
 
 ---
 
 ## Stretch
 
+- Intel GPU acceleration for Tier 2 via IPEX-LLM or OpenVINO on Iris Xe (modest gain expected — still memory-bandwidth-bound — worth trying only after the rest works)
 - VS Code / Excel add-in surface
 - Diff mode: what changed between two versions of a model, semantically
 - Learn a firm's house conventions from a corpus of their clean models
 - Extend to Google Sheets via the Sheets API
+- Optional hosted-frontier-model tier for users who want higher recall and accept the cost/privacy tradeoff — strictly opt-in, never the default
 
 ## Reading
 
 - Panko, "What We Know About Spreadsheet Errors" — the foundational error-rate research
 - EuSpRIG (European Spreadsheet Risks Interest Group) conference archive — the only community that takes this seriously
-- `openpyxl` formula parsing docs, and the `formulas` library source
+- `openpyxl` formula parsing docs
