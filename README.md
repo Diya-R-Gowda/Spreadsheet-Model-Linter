@@ -6,6 +6,32 @@ Runs entirely offline, on commodity hardware, at zero cost — no API keys, no c
 
 ---
 
+## Status
+
+**Week 1 (parsing spine) is done.** The workbook parser and `ssmlint dump` CLI exist and are tested. Everything past that — R1C1 normalization, dependency graph, block detection, rule engine, semantic layer — is not built yet.
+
+## Usage
+
+```bash
+# from the repo root
+python -m venv .venv
+./.venv/Scripts/activate        # Windows; use `source .venv/bin/activate` on macOS/Linux
+pip install -e ".[dev]"
+
+# dump a workbook's parsed structure to stdout
+ssmlint dump path/to/workbook.xlsx
+
+# or write it to a file
+ssmlint dump path/to/workbook.xlsx -o out.json
+
+# run the test suite (regenerates synthetic fixture workbooks automatically)
+pytest
+```
+
+`ssmlint dump` loads the workbook with `data_only=False`, so formulas come through as raw strings (e.g. `=B2*1.05`), never as Excel's last-cached computed value. Output is a JSON document with per-sheet cell records (address, formula, literal value, number format, merged-range membership, and any detected cross-sheet references), resolved named ranges (workbook- and sheet-scoped), and a `skipped` list logging anything the parser couldn't represent cleanly (array formulas, `LET`/`LAMBDA`, structured table references) so later pipeline stages know what still needs handling.
+
+---
+
 ## The Problem
 
 Financial models run companies, and they are catastrophically error-prone. Studies of production spreadsheets consistently find errors in 80–90% of them. Real-world consequences have included multi-billion-dollar trading losses and retracted academic economics papers.
