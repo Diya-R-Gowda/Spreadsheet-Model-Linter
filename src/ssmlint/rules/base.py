@@ -23,6 +23,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 from ..blocks import SheetBlocks
+from ..depgraph import DependencyGraph
 
 
 @dataclass(frozen=True)
@@ -49,5 +50,18 @@ class Rule(ABC):
     rule_id: str
 
     @abstractmethod
-    def evaluate(self, sheet_blocks: list[SheetBlocks]) -> list[Issue]:
-        """Return zero or more Issues found across all given sheets' blocks."""
+    def evaluate(
+        self, sheet_blocks: list[SheetBlocks], graph: DependencyGraph | None = None
+    ) -> list[Issue]:
+        """Return zero or more Issues found across all given sheets' blocks.
+
+        `graph` is optional and defaults to None: most Tier 0 rules (e.g.
+        literal-in-formula-block, range-boundary-mismatch) need nothing
+        beyond blocks.py's own output and never reference it. A rule that
+        genuinely needs precedent/empty-cell information (e.g.
+        reference-to-blank, which compares block members' precedents
+        against each other via DependencyGraph.precedents()/is_empty())
+        requires it be passed. Added as an optional parameter rather than
+        a required one specifically so existing rules and their call
+        sites/tests need no changes.
+        """
