@@ -164,6 +164,39 @@ def build_revenue_row_with_hardcode() -> openpyxl.Workbook:
     return wb
 
 
+def build_range_boundary_mismatch() -> openpyxl.Workbook:
+    """A rolling 3-month trailing-sum row where one cell's range is off by one.
+
+    Row 4 holds 12 months of raw data (B4:M4). Row 5 sums the trailing
+    3 months for each column from D5 onward — except H5, which sums only
+    the trailing 2 months (a hardcoded off-by-one instead of extending
+    the range to match its neighbors). D5:G5 and I5:M5 should cluster
+    into two blocks sharing the identical `SUM(3-trailing)` pattern, with
+    H5 sitting between them as the deliberate off-by-one deviation.
+    """
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Rolling"
+
+    ws["A4"] = "Monthly Data"
+    for i, month in enumerate(REVENUE_MONTHS):
+        col = get_column_letter(2 + i)
+        ws[f"{col}3"] = month
+        ws[f"{col}4"] = 1000 * (i + 1)
+
+    ws["A5"] = "Trailing 3-Month Sum"
+    for col_idx in range(4, 2 + len(REVENUE_MONTHS)):
+        this_letter = get_column_letter(col_idx)
+        cell = ws[f"{this_letter}5"]
+        if this_letter == "H":
+            start_letter = get_column_letter(col_idx - 1)  # off-by-one: only 2 months
+        else:
+            start_letter = get_column_letter(col_idx - 2)
+        cell.value = f"=SUM({start_letter}4:{this_letter}4)"
+
+    return wb
+
+
 def build_circular_reference() -> openpyxl.Workbook:
     """A direct two-cell circular reference: A1 depends on B1, B1 depends on A1."""
     wb = openpyxl.Workbook()
@@ -203,6 +236,7 @@ def main() -> None:
     build_circular_reference().save(FIXTURES_DIR / "circular_reference.xlsx")
     build_blank_reference().save(FIXTURES_DIR / "blank_reference.xlsx")
     build_revenue_row_with_hardcode().save(FIXTURES_DIR / "revenue_row_with_hardcode.xlsx")
+    build_range_boundary_mismatch().save(FIXTURES_DIR / "range_boundary_mismatch.xlsx")
     print(f"Wrote fixtures to {FIXTURES_DIR}")
 
 
