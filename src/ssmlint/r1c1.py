@@ -47,28 +47,37 @@ CROSS-SHEET REFERENCES
 ------------------------
 A CellRef/RangeRef with sheet=None means "same sheet as the formula's own
 cell" and contributes no sheet marker to the output at all. A CellRef with
-an explicit sheet name is always absolute in that respect — Excel has no
-concept of "the sheet one to the right" for a plain formula reference (3-D
-ranges, which would need that, are already rejected upstream in stage
-[2]) — so the sheet name is emitted verbatim, once, as a `Sheet!` prefix
-kept structurally separate from the R/C part (`Sheet2!R[1]C[1]`, never
-interleaved into the offsets). Two important consequences:
+an explicit sheet name is compared against `origin_sheet` (a required
+parameter — see FIXED below): if it names the origin's own sheet, it is
+collapsed to exactly the same output as the implicit form, since Excel
+treats "=Sheet1!B14" and "=B14" as identical when both physically live on
+Sheet1. Only a reference to a genuinely *different* sheet keeps a
+`Sheet!` prefix — Excel has no concept of "the sheet one to the right"
+for a plain formula reference (3-D ranges, which would need that, are
+already rejected upstream in stage [2]) — emitted verbatim, once, kept
+structurally separate from the R/C part (`Sheet2!R[1]C[1]`, never
+interleaved into the offsets).
 
-  1. The offset math for a cross-sheet reference depends only on the
-     *origin cell's* row/column, never on which sheet the origin formula
-     itself lives on — so a formula on Sheet1!A1 referencing Sheet2!B2
-     and the "same" formula on Sheet3!A1 referencing Sheet2!B2 normalize
-     identically. (This falls out of the design for free: `normalize()`
-     is never even given the origin's sheet, only its row/column.)
-  2. KNOWN LIMITATION: a formula that explicitly spells out its own
-     sheet name (e.g. "=Sheet1!B14*C14" while physically living on
-     Sheet1) is treated as cross-sheet, because this module has no way
-     to know the origin's sheet name and compare it — only the origin's
-     row/column are passed in. It will therefore NOT normalize
-     identically to the equivalent implicit-sheet formula "=B14*C14",
-     even though they mean the same thing in Excel. Fixing this would
-     require threading the origin's sheet name through the public API;
-     out of scope for this stage.
+  The offset math itself still depends only on the *origin cell's*
+  row/column, regardless of sheet: a formula on Sheet1!A1 referencing
+  Sheet2!B2 and the "same" formula on Sheet3!A1 referencing Sheet2!B2
+  still normalize identically to each other — neither origin sheet is
+  Sheet2, so both keep the `Sheet2!` prefix and compute the same offsets.
+
+  FIXED: earlier versions of `normalize()` took only the origin's plain
+  address, never its sheet, so an explicit self-sheet reference
+  (`=Sheet1!B14*C14` while living on Sheet1) had no way to be recognized
+  as "actually the same sheet" and was always treated as cross-sheet —
+  it would NOT normalize identically to the equivalent implicit form
+  `=B14*C14`, even though Excel treats them as identical. This caused a
+  real false split in the block detector's row clustering (blocks.py):
+  a cell using the explicit self-sheet form was excluded from an
+  otherwise-identical block purely because of that spelling difference.
+  Fixed by adding `origin_sheet` as a required parameter to `normalize()`.
+  This does NOT extend to `NamedRangeRef` — a sheet-scoped named range's
+  `Sheet!Name` prefix is unaffected by this fix and still always emitted
+  verbatim when present (see OTHER NODE TYPES below); collapsing that
+  too was never reported as a bug and is out of scope for this fix.
 
 OTHER NODE TYPES
 ------------------
@@ -131,16 +140,20 @@ def _cell_ref_rc(ref: CellRef, origin_row: int, origin_col: int) -> str:
     return f"R{row_part}C{col_part}"
 
 
-def _cell_ref_full(ref: CellRef, origin_row: int, origin_col: int) -> str:
+def _cell_ref_full(ref: CellRef, origin_row: int, origin_col: int, origin_sheet: str) -> str:
     bare = _cell_ref_rc(ref, origin_row, origin_col)
-    return f"{ref.sheet}!{bare}" if ref.sheet is not None else bare
+    if ref.sheet is not None and ref.sheet != origin_sheet:
+        return f"{ref.sheet}!{bare}"
+    return bare
 
 
-def _range_ref_full(ref: RangeRef, origin_row: int, origin_col: int) -> str:
+def _range_ref_full(ref: RangeRef, origin_row: int, origin_col: int, origin_sheet: str) -> str:
     start_bare = _cell_ref_rc(ref.start, origin_row, origin_col)
     end_bare = _cell_ref_rc(ref.end, origin_row, origin_col)
     combined = f"{start_bare}:{end_bare}"
-    return f"{ref.sheet}!{combined}" if ref.sheet is not None else combined
+    if ref.sheet is not None and ref.sheet != origin_sheet:
+        return f"{ref.sheet}!{combined}"
+    return combined
 
 
 def _format_number(value: float) -> str:
@@ -166,35 +179,35 @@ def _format_literal(value: float | str | bool) -> str:
     raise TypeError(f"unexpected literal type: {type(value)!r}")  # pragma: no cover
 
 
-def _normalize(node: ASTNode, origin_row: int, origin_col: int) -> str:
+def _normalize(node: ASTNode, origin_row: int, origin_col: int, origin_sheet: str) -> str:
     if isinstance(node, Literal):
         return _format_literal(node.value)
     if isinstance(node, CellRef):
-        return _cell_ref_full(node, origin_row, origin_col)
+        return _cell_ref_full(node, origin_row, origin_col, origin_sheet)
     if isinstance(node, RangeRef):
-        return _range_ref_full(node, origin_row, origin_col)
+        return _range_ref_full(node, origin_row, origin_col, origin_sheet)
     if isinstance(node, NamedRangeRef):
         return f"{node.sheet}!{node.name}" if node.sheet is not None else node.name
     if isinstance(node, FunctionCall):
-        args = ",".join(_normalize(arg, origin_row, origin_col) for arg in node.args)
+        args = ",".join(_normalize(arg, origin_row, origin_col, origin_sheet) for arg in node.args)
         return f"{node.name.upper()}({args})"
     if isinstance(node, BinaryOp):
-        left = _normalize(node.left, origin_row, origin_col)
-        right = _normalize(node.right, origin_row, origin_col)
+        left = _normalize(node.left, origin_row, origin_col, origin_sheet)
+        right = _normalize(node.right, origin_row, origin_col, origin_sheet)
         return f"({left}{node.op}{right})"
     if isinstance(node, UnaryOp):
-        operand = _normalize(node.operand, origin_row, origin_col)
+        operand = _normalize(node.operand, origin_row, origin_col, origin_sheet)
         return f"({node.op}{operand})"
     raise TypeError(f"unrecognized AST node type: {type(node)!r}")  # pragma: no cover
 
 
-def normalize(ast_node: ASTNode, origin_cell: str) -> str:
+def normalize(ast_node: ASTNode, origin_cell: str, origin_sheet: str) -> str:
     """Normalize a formula AST into a position-independent R1C1-style string.
 
     `origin_cell` is the plain address the formula lives at, e.g. "C14"
-    (no sheet prefix — see the CROSS-SHEET REFERENCES section in this
-    module's docstring for why the origin's sheet is deliberately not
-    part of this API).
+    (no sheet prefix — it's a separate parameter, `origin_sheet`, so a
+    reference's own sheet can be compared against it; see the
+    CROSS-SHEET REFERENCES section in this module's docstring).
     """
     origin_row, origin_col = _parse_origin(origin_cell)
-    return _normalize(ast_node, origin_row, origin_col)
+    return _normalize(ast_node, origin_row, origin_col, origin_sheet)

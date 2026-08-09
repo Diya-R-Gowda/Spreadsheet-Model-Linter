@@ -90,20 +90,20 @@ raise), and splicing graph-only ghost nodes into row grouping by
 re-parsing their address strings would add real complexity for a case no
 fixture or test currently exercises.
 
-KNOWN LIMITATION INHERITED FROM r1c1.py
---------------------------------------------
-r1c1.py documents that a formula which explicitly spells out its own
-sheet name (`=Sheet1!B14*C14` while physically living on Sheet1) normalizes
-differently from the equivalent implicit-sheet formula (`=B14*C14`), even
-though Excel treats them identically. This module inherits that
-limitation unchanged: two cells in the same row, structurally identical
-except one spells out its own sheet name, will be seen as a pattern break
-here and can split what should be one block into two (or report one as a
-non-conforming/near-miss neighbor of the other). No fixture in this stage
-exercises self-sheet-qualified references, so this hasn't been observed in
-practice here, but it's a real, inherited edge case worth flagging rather
-than silently working around in this module (that would duplicate origin-
-sheet-aware logic r1c1.py itself deliberately doesn't have).
+FIXED: SELF-SHEET-QUALIFIED REFERENCES NO LONGER CAUSE FALSE SPLITS
+------------------------------------------------------------------------
+r1c1.normalize() used to have no way to know which sheet a formula's own
+cell lived on, so an explicit self-sheet reference (`=Sheet1!B14*C14`
+while physically living on Sheet1) normalized differently from the
+equivalent implicit form (`=B14*C14`) even though Excel treats them
+identically — this module inherited that as a real bug: two structurally
+identical cells in the same row, one spelling out its own sheet name,
+would be seen as a pattern break and could split what should be one block
+into two. `r1c1.normalize()` now takes the origin's sheet as a required
+parameter and collapses that case (see r1c1.py's own docstring); this
+module passes each cell's own sheet (split from its address) as that
+parameter, so the false split no longer occurs. Regression-tested in
+test_blocks.py.
 """
 
 from __future__ import annotations
@@ -213,7 +213,7 @@ def _row_groups(sheet_name: str, cells: list[CellRecord]) -> dict[int, list[_Row
     """Group a sheet's cells by row number, each row sorted by column index."""
     rows: dict[int, list[_RowCell]] = {}
     for record in cells:
-        _sheet, plain = _split_address(record.address)
+        record_sheet, plain = _split_address(record.address)
         col_index, row = _plain_to_col_row(plain)
 
         pattern: str | None = None
@@ -221,7 +221,7 @@ def _row_groups(sheet_name: str, cells: list[CellRecord]) -> dict[int, list[_Row
         if record.formula is not None:
             try:
                 ast_node = parse_formula(record.formula)
-                pattern = normalize(ast_node, plain)
+                pattern = normalize(ast_node, plain, record_sheet)
             except FormulaError as exc:
                 parse_error = str(exc)
 

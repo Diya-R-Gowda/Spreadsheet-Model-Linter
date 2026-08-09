@@ -295,6 +295,40 @@ def test_unparseable_neighbor_is_reported_with_parse_error() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Regression: explicit self-sheet references no longer cause a false split
+# (r1c1.py bugfix — normalize() now takes origin_sheet and collapses
+# "=Model!E14..." on Model to the same pattern as the implicit form)
+# ---------------------------------------------------------------------------
+
+
+def test_explicit_self_sheet_reference_does_not_cause_a_false_split() -> None:
+    # C14:E14 and G14:I14 are structurally identical to F14 in every way
+    # except F14 spells out its own host sheet ("Model!") on both refs.
+    # Before the r1c1.py fix this used to split into two 3-cell blocks
+    # with F14 excluded from both (reproduced during the stage-5 audit).
+    cells = [
+        _cell("Model!C14", formula="=B14*(1+B15)"),
+        _cell("Model!D14", formula="=C14*(1+C15)"),
+        _cell("Model!E14", formula="=D14*(1+D15)"),
+        _cell("Model!F14", formula="=Model!E14*(1+Model!E15)"),
+        _cell("Model!G14", formula="=F14*(1+F15)"),
+        _cell("Model!H14", formula="=G14*(1+G15)"),
+        _cell("Model!I14", formula="=H14*(1+H15)"),
+    ]
+    sheet_blocks = _detect([SheetRecord(name="Model", cells=cells)])
+    blocks = sheet_blocks[0].blocks
+
+    assert len(blocks) == 1
+    block = blocks[0]
+    assert block.span == "C14:I14"
+    assert block.cells == [
+        "Model!C14", "Model!D14", "Model!E14", "Model!F14", "Model!G14", "Model!H14", "Model!I14",
+    ]
+    assert block.non_conforming == []
+    assert block.near_misses == []
+
+
+# ---------------------------------------------------------------------------
 # Real-fixture integration: README's own C14:N14-style example
 # ---------------------------------------------------------------------------
 
