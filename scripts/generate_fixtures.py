@@ -232,6 +232,46 @@ def build_reference_to_blank_gap() -> openpyxl.Workbook:
     return wb
 
 
+def build_inconsistent_anchoring() -> openpyxl.Workbook:
+    """A growth-rate-driven revenue row where one cell's anchoring drifts.
+
+    B1 holds a fixed growth-rate assumption. Row 14 is a chain of
+    "=prev*(1+$B$1)" formulas, each dragged across from the previous
+    column, correctly holding B1 fixed with both axes anchored — except
+    H14, which lost its column anchor (`B$1` instead of `$B$1`). Right
+    now H14 still computes correctly (it's still literally reading B1),
+    but this is exactly the mistake horizontal fill-drag causes for real:
+    without the column anchor, filling further right would silently walk
+    the reference to C1, D1, and so on instead of staying pinned to B1.
+    """
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Model"
+
+    ws["A1"] = "Growth Rate Assumption"
+    ws["B1"] = 0.05
+
+    ws["A13"] = "Line Item"
+    for i, month in enumerate(REVENUE_MONTHS):
+        ws.cell(row=13, column=2 + i, value=month)
+
+    ws["A14"] = "Revenue"
+    ws["B14"] = 100000
+    ws["B14"].number_format = "#,##0"
+
+    for col_idx in range(3, 2 + len(REVENUE_MONTHS)):
+        prev_letter = get_column_letter(col_idx - 1)
+        this_letter = get_column_letter(col_idx)
+        cell = ws[f"{this_letter}14"]
+        if this_letter == "H":
+            cell.value = f"={prev_letter}14*(1+B$1)"  # anchoring drift: lost the column anchor
+        else:
+            cell.value = f"={prev_letter}14*(1+$B$1)"
+        cell.number_format = "#,##0"
+
+    return wb
+
+
 def build_circular_reference() -> openpyxl.Workbook:
     """A direct two-cell circular reference: A1 depends on B1, B1 depends on A1."""
     wb = openpyxl.Workbook()
@@ -273,6 +313,7 @@ def main() -> None:
     build_revenue_row_with_hardcode().save(FIXTURES_DIR / "revenue_row_with_hardcode.xlsx")
     build_range_boundary_mismatch().save(FIXTURES_DIR / "range_boundary_mismatch.xlsx")
     build_reference_to_blank_gap().save(FIXTURES_DIR / "reference_to_blank_gap.xlsx")
+    build_inconsistent_anchoring().save(FIXTURES_DIR / "inconsistent_anchoring.xlsx")
     print(f"Wrote fixtures to {FIXTURES_DIR}")
 
 
