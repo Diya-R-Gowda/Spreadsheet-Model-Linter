@@ -1,21 +1,24 @@
 """Tests for rules.reference_to_blank.ReferenceToBlankRule — the third Tier 0 rule.
 
-All cases use hand-built ParsedWorkbook constructions (no new .xlsx
-fixture — scripts/generate_fixtures.py is outside src/ssmlint/rules/ and
-wasn't pre-approved for this stage the way it was for 6a/6b). Covers the
-three investigation scenarios (genuine gap flagged, isolated reference
-never flagged, uniform block reference never flagged), the severity
-split, a member with more than one blank precedent, and the required
-graph argument.
+Most cases use hand-built ParsedWorkbook constructions for precise
+control over block shape (the three investigation scenarios: genuine gap
+flagged, isolated reference never flagged, uniform block reference never
+flagged), plus the severity split, a member with more than one blank
+precedent, and the required graph argument. The fixture-based test at
+the bottom covers the real integration path end-to-end (parser ->
+tokenizer -> r1c1 -> depgraph -> blocks -> rule) via
+reference_to_blank_gap.xlsx.
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import pytest
 
 from ssmlint.blocks import SheetBlocks
 from ssmlint.depgraph import build_graph
-from ssmlint.parser import CellRecord, ParsedWorkbook, SheetRecord
+from ssmlint.parser import CellRecord, ParsedWorkbook, SheetRecord, parse_workbook
 from ssmlint.blocks import detect_blocks
 from ssmlint.rules import Issue
 from ssmlint.rules.reference_to_blank import ReferenceToBlankRule
@@ -153,3 +156,23 @@ def test_member_with_multiple_blank_precedents_produces_one_issue() -> None:
 def test_missing_graph_raises_value_error() -> None:
     with pytest.raises(ValueError, match="requires the dependency graph"):
         ReferenceToBlankRule().evaluate([SheetBlocks(sheet="S1", blocks=[])])
+
+
+# ---------------------------------------------------------------------------
+# Real-fixture integration: a rolling trailing-sum row with one blank month
+# ---------------------------------------------------------------------------
+
+
+def test_reference_to_blank_gap_fixture(fixtures_dir: Path) -> None:
+    parsed = parse_workbook(fixtures_dir / "reference_to_blank_gap.xlsx")
+    graph = build_graph(parsed)
+    sheet_blocks = detect_blocks(parsed, graph)
+    issues = ReferenceToBlankRule().evaluate(sheet_blocks, graph)
+
+    assert {i.cell for i in issues} == {"Rolling!F5", "Rolling!G5", "Rolling!H5"}
+    for issue in issues:
+        assert issue.rule_id == "reference-to-blank"
+        assert issue.severity == "high"  # 7 clean vs 3 affected
+        assert "Rolling!F4" in issue.explanation
+        assert "7 other cells" in issue.explanation
+        assert "3 of 10 members" in issue.explanation

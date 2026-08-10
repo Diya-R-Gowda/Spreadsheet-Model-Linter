@@ -197,6 +197,41 @@ def build_range_boundary_mismatch() -> openpyxl.Workbook:
     return wb
 
 
+def build_reference_to_blank_gap() -> openpyxl.Workbook:
+    """A rolling 3-month trailing-sum row where one month's raw data is blank.
+
+    Row 4 holds 12 months of raw data (B4:M4) — except F4, which is left
+    genuinely blank (no value, no formula). Row 5 sums the trailing 3
+    months for each column from D5 onward, all sharing the identical
+    `SUM(3-trailing)` pattern (unlike range_boundary_mismatch.xlsx, no
+    boundary is off — every formula's range shape is correct). Because
+    F4 is blank, the three formulas whose trailing window includes it
+    (F5, G5, H5) each read a blank precedent, while the rest of the
+    block's members (D5, E5, I5..M5) read real data throughout — a
+    genuine majority-clean/minority-affected split for
+    reference_to_blank.py to catch.
+    """
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Rolling"
+
+    ws["A4"] = "Monthly Data"
+    for i, month in enumerate(REVENUE_MONTHS):
+        col = get_column_letter(2 + i)
+        ws[f"{col}3"] = month
+        if col != "F":
+            ws[f"{col}4"] = 1000 * (i + 1)
+        # F4 intentionally left blank -- a genuine gap in the monthly data
+
+    ws["A5"] = "Trailing 3-Month Sum"
+    for col_idx in range(4, 2 + len(REVENUE_MONTHS)):
+        this_letter = get_column_letter(col_idx)
+        start_letter = get_column_letter(col_idx - 2)
+        ws[f"{this_letter}5"] = f"=SUM({start_letter}4:{this_letter}4)"
+
+    return wb
+
+
 def build_circular_reference() -> openpyxl.Workbook:
     """A direct two-cell circular reference: A1 depends on B1, B1 depends on A1."""
     wb = openpyxl.Workbook()
@@ -237,6 +272,7 @@ def main() -> None:
     build_blank_reference().save(FIXTURES_DIR / "blank_reference.xlsx")
     build_revenue_row_with_hardcode().save(FIXTURES_DIR / "revenue_row_with_hardcode.xlsx")
     build_range_boundary_mismatch().save(FIXTURES_DIR / "range_boundary_mismatch.xlsx")
+    build_reference_to_blank_gap().save(FIXTURES_DIR / "reference_to_blank_gap.xlsx")
     print(f"Wrote fixtures to {FIXTURES_DIR}")
 
 
