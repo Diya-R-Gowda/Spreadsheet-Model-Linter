@@ -240,7 +240,7 @@ class EvaluationReport:
         }
 
 
-def _evaluate_rule(rule: Rule, sheet_blocks, graph: DependencyGraph) -> list[Issue]:
+def evaluate_rule(rule: Rule, sheet_blocks, graph: DependencyGraph) -> list[Issue]:
     """Calls `rule.evaluate()` with `graph` only if the rule's own
     signature actually accepts it -- `LiteralInBlockRule` and
     `RangeBoundaryRule` don't take a `graph` parameter at all (confirmed
@@ -288,7 +288,7 @@ def run_evaluation(corpus_dir: Path, rules: dict[str, Rule] | None = None) -> Ev
             clean_baseline_count += 1
 
         for rule_id, rule in rules.items():
-            issues = _evaluate_rule(rule, sheet_blocks, graph)
+            issues = evaluate_rule(rule, sheet_blocks, graph)
             scored = score_rule_on_entry(name, issues, ground_truth, rule_id)
             all_scored_by_rule[rule_id].extend(scored)
             fn_by_rule[rule_id] += count_false_negatives(issues, ground_truth, rule_id)
