@@ -91,21 +91,15 @@ class CorpusEntry:
 # ---------------------------------------------------------------------------
 
 
-def _growth_chain_workbook(
-    n: int, injection: tuple[str, int] | None = None
-) -> tuple[openpyxl.Workbook, list[CellGroundTruth]]:
-    """A seed literal at B14 followed by `n` formula cells (C14 onward),
-    each `=prev*(1+$B$1)`. `injection` is `(kind, idx)` where `kind` is
-    "literal" or "anchoring" and `idx` is a 0-based index into the n
-    formula cells (0 = the first formula cell, C14).
+def _write_growth_chain_row(
+    ws, sheet: str, row: int, n: int, injection: tuple[str, int] | None = None
+) -> list[CellGroundTruth]:
+    """Writes a seed literal at column B of `row`, followed by `n` formula
+    cells (C onward), each `=prev*(1+$B$1)`. Assumes `ws["B1"]` (the
+    shared growth-rate driver) is already written by the caller. `injection`
+    is `(kind, idx)` where `kind` is "literal" or "anchoring" and `idx` is
+    a 0-based index into the n formula cells (0 = the first formula cell).
     """
-    sheet = "Model"
-    row = 14
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = sheet
-
-    ws["B1"] = GROWTH_RATE
     ws.cell(row=row, column=2, value=SEED_VALUE)
     ground_truth = [
         CellGroundTruth(cell=f"{sheet}!B{row}", state="known_intentional", note="growth-chain seed literal")
@@ -130,6 +124,21 @@ def _growth_chain_workbook(
             ws.cell(row=row, column=col, value=f"={prev_letter}{row}*(1+$B$1)")
             ground_truth.append(CellGroundTruth(cell=addr, state="clean"))
 
+    return ground_truth
+
+
+def _growth_chain_workbook(
+    n: int, injection: tuple[str, int] | None = None
+) -> tuple[openpyxl.Workbook, list[CellGroundTruth]]:
+    """A single growth-chain row (row 14) on its own workbook. See
+    `_write_growth_chain_row` for the row-construction details.
+    """
+    sheet = "Model"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = sheet
+    ws["B1"] = GROWTH_RATE
+    ground_truth = _write_growth_chain_row(ws, sheet, 14, n, injection)
     return wb, ground_truth
 
 
@@ -138,25 +147,19 @@ def _growth_chain_workbook(
 # ---------------------------------------------------------------------------
 
 
-def _trailing_sum_workbook(
-    m: int, injection: tuple[str, int] | None = None
-) -> tuple[openpyxl.Workbook, list[CellGroundTruth]]:
-    """`m` months of raw data at row 4 (B4 onward), and a trailing-3-month
-    `SUM` row at row 5 starting at the 3rd data column (`n = m - 2`
-    formula cells). `injection` is `(kind, idx)`:
+def _write_trailing_sum_row(
+    ws, sheet: str, data_row: int, sum_row: int, m: int, injection: tuple[str, int] | None = None
+) -> list[CellGroundTruth]:
+    """Writes `m` months of raw data at `data_row` (column B onward), and a
+    trailing-3-month `SUM` row at `sum_row` starting at the 3rd data
+    column (`n = m - 2` formula cells). `injection` is `(kind, idx)`:
       - ("range_boundary", idx): idx is a 0-based index into the n SUM
         cells; that one cell's range start shifts by one (2-month window
         instead of 3).
       - ("reference_to_blank", idx): idx is a 0-based index into the m
         raw data columns; that one raw cell is left genuinely blank.
     """
-    sheet = "Rolling"
-    data_row, sum_row = 4, 5
     n = m - 2
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = sheet
-
     inject_kind, inject_idx = injection if injection else (None, None)
     blank_idx = inject_idx if inject_kind == "reference_to_blank" else None
     range_boundary_idx = inject_idx if inject_kind == "range_boundary" else None
@@ -190,7 +193,52 @@ def _trailing_sum_workbook(
         else:
             ground_truth.append(CellGroundTruth(cell=addr, state="clean"))
 
+    return ground_truth
+
+
+def _trailing_sum_workbook(
+    m: int, injection: tuple[str, int] | None = None
+) -> tuple[openpyxl.Workbook, list[CellGroundTruth]]:
+    """A single trailing-3-month-sum row (data row 4, sum row 5) on its
+    own workbook. See `_write_trailing_sum_row` for the row-construction
+    details.
+    """
+    sheet = "Rolling"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = sheet
+    ground_truth = _write_trailing_sum_row(ws, sheet, 4, 5, m, injection)
     return wb, ground_truth
+
+
+# ---------------------------------------------------------------------------
+# Shape: cross-block isolation (one sheet, two independent blocks)
+# ---------------------------------------------------------------------------
+
+
+def _cross_block_isolation_workbook() -> tuple[openpyxl.Workbook, list[CellGroundTruth]]:
+    """One sheet, two independent row blocks far apart (row 14, row 30):
+    a corrupted growth-chain block (literal injection) and a clean
+    trailing-sum block. Proves corrupting one block raises nothing in
+    the other. blocks.py clusters strictly row-wise, so two different
+    rows are already fully independent by construction -- the row gap
+    is for sheet realism, not a detection requirement. The clean block
+    deliberately uses the trailing-sum shape, not a second growth-chain,
+    because growth-chain always has a seed-literal neighbor that
+    legitimately fires literal-in-formula-block on its own (see the
+    Week 4 design note) -- trailing-sum has no such neighbor, so it's
+    the shape that can genuinely produce zero issues from every rule,
+    proving isolation with no caveat.
+    """
+    sheet = "Combined"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = sheet
+    ws["B1"] = GROWTH_RATE
+
+    corrupted_gt = _write_growth_chain_row(ws, sheet, 14, 8, ("literal", 3))
+    clean_gt = _write_trailing_sum_row(ws, sheet, 29, 30, 10, None)
+    return wb, corrupted_gt + clean_gt
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +313,13 @@ def _trailing_sum_entries() -> list[CorpusEntry]:
     return entries
 
 
+def _cross_block_isolation_entries() -> list[CorpusEntry]:
+    wb, gt = _cross_block_isolation_workbook()
+    name = "cross_block_isolation__literal_in_block"
+    wb.save(CORPUS_DIR / f"{name}.xlsx")
+    return [CorpusEntry(name=name, base_shape="cross_block_isolation", cells=gt)]
+
+
 def _write_ground_truth(entry: CorpusEntry) -> None:
     payload = {
         "workbook": f"{entry.name}.xlsx",
@@ -276,7 +331,7 @@ def _write_ground_truth(entry: CorpusEntry) -> None:
 
 def main() -> None:
     CORPUS_DIR.mkdir(parents=True, exist_ok=True)
-    entries = _growth_chain_entries() + _trailing_sum_entries()
+    entries = _growth_chain_entries() + _trailing_sum_entries() + _cross_block_isolation_entries()
     for entry in entries:
         _write_ground_truth(entry)
     print(f"Wrote {len(entries)} corpus entries ({len(entries) * 2} files) to {CORPUS_DIR}")

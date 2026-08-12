@@ -193,3 +193,54 @@ def test_full_corpus_sweep_ground_truth_is_internally_consistent() -> None:
                 assert cell_gt.rule_id in known_rule_ids
             else:
                 assert cell_gt.rule_id is None
+
+
+def test_cross_block_isolation_corrupting_one_block_never_flags_the_other(tmp_path: Path) -> None:
+    """Two independent row blocks on one sheet (row 14: growth-chain with
+    a literal injection; row 30: a clean trailing-sum block, far apart).
+    Confirms corrupting the first block raises exactly the expected
+    issues there, AND raises zero issues anywhere in the second block --
+    not just that the injected bug is caught, but that the clean block is
+    completely untouched by every rule.
+    """
+    wb, gt = generate_corpus._cross_block_isolation_workbook()
+    parsed = parse_workbook(_save(wb, tmp_path, "cross_block_isolation_case"))
+    graph = build_graph(parsed)
+    sheet_blocks = detect_blocks(parsed, graph)
+
+    injected = _cells_by_state(gt, "injected_bug")
+    known_intentional = _cells_by_state(gt, "known_intentional")
+    clean = _cells_by_state(gt, "clean")
+    assert injected == {"Combined!F14"}
+    assert known_intentional == {"Combined!B14"}
+    row_30_clean_cells = {c for c in clean if c.split("!")[1].lstrip("ABCDEFGHIJKLMNOPQRSTUVWXYZ") == "30"}
+    assert row_30_clean_cells == {
+        "Combined!D30", "Combined!E30", "Combined!F30", "Combined!G30",
+        "Combined!H30", "Combined!I30", "Combined!J30", "Combined!K30",
+    }
+
+    literal_issues = LiteralInBlockRule().evaluate(sheet_blocks)
+    anchoring_issues = InconsistentAnchoringRule().evaluate(sheet_blocks)
+    range_issues = RangeBoundaryRule().evaluate(sheet_blocks)
+    blank_issues = ReferenceToBlankRule().evaluate(sheet_blocks, graph=graph)
+
+    # The corrupted block (row 14): exactly the injected bug plus the
+    # expected seed-literal issue -- same shape already proven in
+    # test_literal_injection_flags_injected_and_seed_cells.
+    assert {i.cell for i in literal_issues} == {"Combined!B14", "Combined!F14"}
+    by_cell = {i.cell: i for i in literal_issues}
+    assert by_cell["Combined!F14"].severity == "high"
+    assert by_cell["Combined!B14"].severity == "medium"
+
+    # The clean block (row 30): zero issues from every rule, not merely
+    # zero on its own block members -- the strong claim the prompt asked
+    # for, verified directly rather than inferred from the corrupted
+    # block's correctness.
+    row_30_issues_from_any_rule = [
+        i for i in (literal_issues + anchoring_issues + range_issues + blank_issues)
+        if i.cell.split("!")[1].lstrip("ABCDEFGHIJKLMNOPQRSTUVWXYZ") == "30"
+    ]
+    assert row_30_issues_from_any_rule == []
+    assert anchoring_issues == []
+    assert range_issues == []
+    assert blank_issues == []
