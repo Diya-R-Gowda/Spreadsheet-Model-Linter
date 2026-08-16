@@ -22,7 +22,7 @@ Project layout:
 ```
 src/ssmlint/
   parser.py          # [1] workbook parsing spine
-  cli.py              # `ssmlint dump` entry point
+  cli.py              # `ssmlint dump` / `ssmlint report` entry points
   tokenizer.py         # [2] formula lexer
   formula_parser.py    # [2] formula AST builder
   ast_nodes.py          # [2] AST node dataclasses
@@ -36,14 +36,19 @@ src/ssmlint/
     range_boundary.py            # range-boundary-mismatch rule
     reference_to_blank.py         # reference-to-blank rule
     inconsistent_anchoring.py      # inconsistent-anchoring rule
-  evaluation.py                 # Week 4: TP/FP/FN/known_intentional scoring logic, reused by Week 5
+  evaluation.py                 # Week 4: TP/FP/FN/known_intentional scoring logic, reused by Week 5/6
   labeling.py                    # Week 5: block-level 4-way label generation + split (plumbing only, no ML deps)
+  ablation.py                     # Week 6: [Configuration, Precision, Recall, Precision@10, Cost, Runtime] table
+  report.py                        # Week 6: single-workbook ranked JSON + HTML report builder
+  templates/report.html.jinja       # Week 6: the single self-contained Jinja2 template
 scripts/generate_fixtures.py   # builds synthetic .xlsx test fixtures
 scripts/generate_corpus.py      # builds the synthetic-corruption evaluation/training corpus
 scripts/run_evaluation.py        # Week 4 CLI: runs the rule engine against corpus/, prints the scored report
 scripts/run_labeling.py           # Week 5 CLI: prints the label-generation/training-readiness report
+scripts/run_ablation.py            # Week 6 CLI: prints the ablation table
 tests/                          # pytest suite; fixtures regenerated per session, not committed
 corpus/                          # synthetic-corruption corpus (.xlsx + paired ground-truth JSON); generated on demand, not committed
+diya.md                          # the approved Week 6 implementation plan, saved verbatim before implementation started
 ```
 
 ---
@@ -82,7 +87,7 @@ Nine-stage pipeline, each stage consuming the previous stage's output:
 [8] Local LLM Adjudicator (Tier 2, optional, flag-gated) ─► same 4-way label 🔴
    │                            3B model via Ollama, grammar-constrained
    ▼
-[9] Report Builder ──────────► ranked JSON + standalone HTML                🔴
+[9] Report Builder ──────────► ranked JSON + standalone HTML                🟢 (Tier 0 only)
 ```
 
 **Design principle:** everything downstream of stage [2] consumes the AST, never raw formula strings or raw cell dumps. Any semantic layer (Tier 1 or Tier 2) sees a compact normalized block description, never a pasted sheet.
@@ -100,7 +105,7 @@ Nine-stage pipeline, each stage consuming the previous stage's output:
 | Clustering | R1C1 equality + `rapidfuzz` | Exact match covers most; fuzzy catches near-misses |
 | Semantic layer — Tier 1 (planned) | DeBERTa-v3-small / ModernBERT-base, fine-tuned on synthetic-corruption labels | CPU-only, ms/block, $0 |
 | Semantic layer — Tier 2 (planned, optional) | Local 3B model via Ollama (Qwen2.5-3B-Instruct or Phi-3-mini) | Fits in 16GB RAM; 7B+ excluded for latency reasons |
-| Report | Jinja2 → single-file HTML (planned) | Must open without a server |
+| Report | Jinja2 → single-file HTML | Must open without a server |
 | Tests | `pytest` + generated fixture workbooks | Fixtures regenerated per session, not committed as binaries |
 
 ---
@@ -240,6 +245,16 @@ The README's original Build Plan bundled "R1C1 normalization + dependency graph"
 
 | Task | Status | Detail |
 |---|:---:|---|
-| Local LLM adjudicator | 🔴 | Not started, optional/flag-gated. 3B model via Ollama (Qwen2.5-3B-Instruct or Phi-3-mini), grammar-constrained to the same 4-way label, cached by normalized block signature, calls capped per workbook. |
-| Full ablation table | 🔴 | Not started. Precision, recall, precision@10, cost, and median runtime for Tier 0 / Tier 0+1 / Tier 0+1+2 — this is the project's headline deliverable, not a single precision/recall number. |
-| HTML report builder | 🔴 | Not started. Jinja2 → single-file HTML, sheet heatmap, click-through to cells, severity filtering, tagged with which tier flagged each issue. |
+| Local LLM adjudicator | 🔴 | Explicitly deferred, not started — see design note below. Tier 1/2 remain blocked on the Week 5 corpus-expansion prerequisite, which the user chose to defer in favor of shipping Tier 0's report/ablation deliverables first. |
+| Full ablation table | 🟢 | `src/ssmlint/ablation.py` + `scripts/run_ablation.py`. Micro-averages Week 4's per-rule precision/recall/precision@10 into one Tier-0 row (README's [Configuration, Precision, Recall, Precision@10, Cost, Median runtime/workbook] shape), plus new full-pipeline runtime instrumentation. Tier 0+1/0+1+2 rows structurally present, `status="not_yet_available"`, `cost="$0"` (an architectural fact, not a measurement). Real result: Tier 0 scores **1.000/1.000/1.000**, median 3.4ms/workbook. |
+| HTML report builder | 🟢 | `src/ssmlint/report.py` + `src/ssmlint/templates/report.html.jinja` + new `ssmlint report <path>` CLI subcommand. Runs the real Tier 0 pipeline against one workbook, ranks issues (severity desc + `(rule_id, cell)` tiebreak), builds a per-sheet heatmap (bounding box over flagged cells), and renders a single self-contained HTML file (client-side severity filtering, click-through from heatmap to issue rows) plus a parallel JSON output — both carrying an explicit Tier-0-only caveat. |
+
+**Design note (2026-08-16): why the Local LLM row stays red.** This week's scope was explicitly confirmed with the user before implementation: build the ablation table and report builder on top of the already-working Tier 0 engine, and leave Tier 1 (blocked since Week 5 — the corpus can't yet support a real 4-way fine-tune) and Tier 2 (which depends on Tier 1 existing) deferred rather than started as a drive-by. Four judgment calls were surfaced and confirmed directly before any code was written (recorded in `diya.md`, the saved plan): add `jinja2` as a new dependency (yes — pure-Python, ~134KB wheel, one tiny transitive dep); wrap `Issue` in a new `RankedIssue` rather than widening the completed-stage `rules/base.py` (confirmed — zero risk to a finished stage, matches `evaluation.py`'s own `ScoredIssue` wrapper precedent); show `"$0"` cost on the two not-yet-built ablation rows since it's a stated architectural fact independent of measurement, while every genuinely-measured field on those rows stays `None`; and put the report command in `cli.py` as `ssmlint report` (not a `scripts/run_*.py` script) since it's a single-workbook, end-user-facing operation like `dump`, not corpus-facing dev tooling.
+
+**Ablation table — how it was solved:** Reuses Week 4's scoring logic entirely rather than duplicating it — `build_ablation_table()` calls `evaluation.run_evaluation()` as-is and reads only `RuleRollup`'s already-public fields to compute one micro-averaged Tier-0 row (`sum(tp)/sum(tp+fp)` for precision, same shape for recall; precision@10 reconstructed as a weighted average of each rule's own top-10 result, documented explicitly in the module docstring as an approximation of a true cross-rule pooled ranking, since no such pooled signal exists). Runtime instrumentation is genuinely new — nothing timed any part of this pipeline before. Confirmed directly with the user, and stated verbatim in `ablation.py`'s docstring: each timed sample covers the full pipeline (fresh `parse_workbook` → `build_graph` → `detect_blocks`, which itself performs per-cell tokenization/AST/R1C1 normalization → all four rule evaluations), not just rule evaluation against pre-built blocks, with no cached state reused across corpus entries. Verified against the real 47-entry corpus: Tier 0 row exactly matches Week 4's own already-verified per-rule totals (TP 11/10/17/10, all FP/FN zero) rolled up to 1.000/1.000/1.000.
+
+**Ablation table — bugs/defects encountered and fixed:** None. The only real design decision (not a bug) was how to reconstruct `tp_in_top_k` from `RuleRollup`'s stored `precision_at_10` ratio and `precision_at_10_k` count without adding a new field to a completed-stage-adjacent file — `round(precision_at_10 * precision_at_10_k)` is exact for these small integer values, confirmed by a unit test using the real verified per-rule totals rather than assumed.
+
+**HTML report builder — how it was solved:** `build_report()` runs the real pipeline (`parse_workbook` → `build_graph` → `detect_blocks` → all four rules) against one workbook — a genuinely different consumer than `evaluation.py`/`ablation.py`, which score against the synthetic corpus's ground truth; a real report has no ground truth at all. Ranking is explicitly adapted, not reinvented, from `evaluation.py`'s severity-desc + deterministic-tiebreak convention (documented in the module docstring) — the tiebreak changes from `evaluation.py`'s `(entry, cell)` to `(rule_id, cell)` since a single-workbook report has no corpus-entry axis. The sheet heatmap is a bounding box computed only from flagged-cell addresses, not a sheet's full used range — a deliberate v1 scoping choice (documented as a known limitation, same as prior stages' documented scope boundaries) to avoid rendering a huge, mostly-empty grid for a large real workbook. The Jinja2 template uses `autoescape=True` since issue explanation/suggested-fix text ultimately derives from formula strings and must never be trusted as safe HTML — confirmed with a deliberate test injecting `<script>alert(1)</script>` into an explanation and asserting the raw tag never appears unescaped in the rendered output. `[tool.setuptools.package-data]` was added to `pyproject.toml` so the `.jinja` template ships inside real installed wheels, not just the editable dev install — verified directly by building a real wheel with `pip wheel` and confirming `ssmlint/templates/report.html.jinja` is actually present inside it, not assumed from the config alone. Verified end-to-end against the real `revenue_row_with_hardcode.xlsx` fixture (already known-flagged: `H14` high, `B14` medium): ranked order, heatmap bounding box, and both HTML and JSON caveat fields all confirmed via real output, not a hand-built stub.
+
+**HTML report builder — bugs/defects encountered and fixed:** None in the implementation. One honest limitation surfaced and disclosed rather than glossed over: no `chromium-cli` or Playwright is available in this environment, so the generated HTML could not be screenshotted and visually inspected by the agent itself — the real default browser was opened directly on the actual rendered file for human review instead, and the rendered markup itself was read and checked by hand (confirming, e.g., that `autoescape` correctly rendered `cell's` as `cell&#39;s`) as the strongest verification actually available, on top of the automated structural/escaping tests.
