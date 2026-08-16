@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Spreadsheet Model Linter report — {{ report.workbook }}</title>
+<style>
+  :root {
+    --high: #b91c1c;
+    --high-bg: #fee2e2;
+    --medium: #b45309;
+    --medium-bg: #fef3c7;
+    --neutral-bg: #f3f4f6;
+    --border: #d1d5db;
+  }
+  body { font-family: -apple-system, Segoe UI, Arial, sans-serif; margin: 2rem; color: #111827; }
+  h1 { margin-bottom: 0.25rem; }
+  .meta { color: #6b7280; margin-bottom: 1rem; }
+  .caveat {
+    background: #eef2ff; border: 1px solid #c7d2fe; border-radius: 6px;
+    padding: 0.75rem 1rem; margin: 1rem 0; font-size: 0.9rem;
+  }
+  .summary { display: flex; gap: 1.5rem; margin: 1rem 0; }
+  .summary div { background: var(--neutral-bg); border-radius: 6px; padding: 0.5rem 1rem; }
+  .filters { margin: 1rem 0; }
+  .filters label { margin-right: 1rem; cursor: pointer; }
+  h2 { margin-top: 2.5rem; border-bottom: 2px solid var(--border); padding-bottom: 0.25rem; }
+  .heatmap { display: grid; gap: 2px; margin: 1rem 0; }
+  .heatmap .hcell {
+    border: 1px solid var(--border); border-radius: 3px; padding: 0.3rem;
+    font-size: 0.75rem; text-align: center; text-decoration: none; color: inherit;
+    min-width: 2.5rem;
+  }
+  .heatmap .hcell.empty { background: white; color: #9ca3af; }
+  .heatmap .hcell.high { background: var(--high-bg); color: var(--high); font-weight: 600; }
+  .heatmap .hcell.medium { background: var(--medium-bg); color: var(--medium); font-weight: 600; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+  th, td { border: 1px solid var(--border); padding: 0.5rem; text-align: left; font-size: 0.9rem; vertical-align: top; }
+  th { background: var(--neutral-bg); }
+  tr.severity-high td.sev-cell { color: var(--high); font-weight: 600; }
+  tr.severity-medium td.sev-cell { color: var(--medium); font-weight: 600; }
+  tr.hidden { display: none; }
+  code { background: var(--neutral-bg); padding: 0.1rem 0.3rem; border-radius: 3px; }
+  footer { margin-top: 3rem; color: #6b7280; font-size: 0.85rem; border-top: 1px solid var(--border); padding-top: 1rem; }
+</style>
+</head>
+<body>
+
+<h1>Spreadsheet Model Linter report</h1>
+<div class="meta">{{ report.workbook }} — generated {{ report.generated_at }}</div>
+
+<div class="caveat">{{ report.caveat }}</div>
+
+<div class="summary">
+  <div>{{ report.issues|length }} total issue{{ "" if report.issues|length == 1 else "s" }}</div>
+  {% for sev, count in report.severity_counts.items() %}
+  <div>{{ count }} {{ sev }}</div>
+  {% endfor %}
+  <div>{{ report.heatmaps|length }} sheet{{ "" if report.heatmaps|length == 1 else "s" }} with findings</div>
+</div>
+
+<div class="filters">
+  <strong>Show severity:</strong>
+  <label><input type="checkbox" class="severity-toggle" data-severity="high" checked> high</label>
+  <label><input type="checkbox" class="severity-toggle" data-severity="medium" checked> medium</label>
+</div>
+
+{% for heatmap in report.heatmaps %}
+<h2>{{ heatmap.sheet }}</h2>
+
+<div class="heatmap" style="grid-template-columns: repeat({{ heatmap.max_col - heatmap.min_col + 1 }}, minmax(2.5rem, 1fr));">
+  {% for row in range(heatmap.min_row, heatmap.max_row + 1) %}
+    {% for col in range(heatmap.min_col, heatmap.max_col + 1) %}
+      {% set addr = cell_address(row, col) %}
+      {% if addr in heatmap.cells %}
+        {% set hc = heatmap.cells[addr] %}
+        <a class="hcell {{ hc.severity }}" href="#issue-{{ heatmap.sheet }}-{{ addr }}" title="{{ hc.issue_count }} issue(s): {{ hc.rule_ids|join(', ') }}">{{ addr }}</a>
+      {% else %}
+        <div class="hcell empty">{{ addr }}</div>
+      {% endif %}
+    {% endfor %}
+  {% endfor %}
+</div>
+
+<table>
+  <thead>
+    <tr><th>Rank</th><th>Cell</th><th>Severity</th><th>Rule</th><th>Tier</th><th>Explanation</th><th>Suggested fix</th></tr>
+  </thead>
+  <tbody>
+    {% for issue in report.issues if issue.sheet == heatmap.sheet %}
+    <tr id="issue-{{ issue.sheet }}-{{ issue.address }}" class="severity-{{ issue.severity }}" data-severity="{{ issue.severity }}">
+      <td>{{ issue.rank }}</td>
+      <td><code>{{ issue.cell }}</code></td>
+      <td class="sev-cell">{{ issue.severity }}</td>
+      <td>{{ issue.rule_id }}</td>
+      <td>{{ issue.tier }}</td>
+      <td>{{ issue.explanation }}</td>
+      <td>{{ issue.suggested_fix }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endfor %}
+
+{% if not report.heatmaps %}
+<p>No issues found.</p>
+{% endif %}
+
+<footer>{{ report.caveat }}</footer>
+
+<script>
+  document.querySelectorAll(".severity-toggle").forEach(function (checkbox) {
+    checkbox.addEventListener("change", function () {
+      var severity = checkbox.dataset.severity;
+      var visible = checkbox.checked;
+      document.querySelectorAll('tr[data-severity="' + severity + '"]').forEach(function (row) {
+        row.classList.toggle("hidden", !visible);
+      });
+    });
+  });
+</script>
+
+</body>
+</html>
