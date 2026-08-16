@@ -1,0 +1,225 @@
+"""Week 6 ablation table — the README's headline evaluation deliverable:
+"Publish the full ablation table (precision, recall, precision@10,
+cost, runtime, per tier)." Scoped Tier 0 only, per the user's explicit
+decision to defer corpus expansion and real Tier 1/2 work (see
+CONTRIBUTING.md's Week 5 follow-up note) — only the "Tier 0 (rules
+only)" row carries real numbers; the other two rows are structurally
+reserved, not fabricated.
+
+This module never duplicates Week 4's scoring logic — it reads only
+`evaluation.py`'s already-public results (`run_evaluation()`,
+`RuleRollup`'s public fields via `EvaluationReport.rollups`) and adds
+exactly two things `evaluation.py` doesn't have: (1) a single
+micro-averaged Tier-0 number aggregated across all four rules (the
+existing data model is per-`rule_id` only, with no "all rules combined"
+row), and (2) runtime instrumentation (no wall-clock timing exists
+anywhere in `evaluation.py`).
+
+WHAT "MEDIAN RUNTIME/WORKBOOK" ACTUALLY MEASURES (confirmed explicitly,
+not left implicit)
+------------------------------------------------------------------------
+Each sample times the genuinely full per-entry pipeline:
+`parser.parse_workbook` (a fresh `ParsedWorkbook`, never reused) ->
+`depgraph.build_graph` -> `blocks.detect_blocks` (which internally
+performs per-cell formula tokenization/AST building and R1C1
+normalization via its own `_row_groups` -- nothing extra needs to be
+called separately here) -> `evaluation.evaluate_rule` for all four
+default rules. So this covers parse -> tokenize -> R1C1 -> depgraph ->
+blocks -> rule evaluation, not just rule evaluation against pre-built
+blocks. Every corpus entry gets its own fresh call chain: `Rule`
+instances are stateless (per `rules/base.py`'s own ABC docstring), and
+no `ParsedWorkbook`/graph/blocks object is reused across entries, so
+there is no cross-entry cached state inflating or deflating the
+measurement. This does mean the corpus gets walked twice per run (once
+inside `run_evaluation()`, once in this module's own timing loop) --
+accepted deliberately rather than widening `evaluation.py` to add an
+internal timing hook, since that would touch a completed-stage-adjacent
+file for a minor optimization (47 corpus entries is trivial either way).
+
+PRECISION@10 AGGREGATION IS AN APPROXIMATION (documented, not silent)
+------------------------------------------------------------------------
+`evaluation.py`'s precision@10 pools each rule's own flags independently
+(there is no single global ranking signal across all four rules beyond
+severity). The Tier-0 row's aggregate precision@10 here is a weighted
+average of each rule's own top-10 result
+(`sum(tp_in_top_k) / sum(precision_at_10_k)`), not a true re-ranked
+pooled-across-all-rules top-10. This is a real approximation, stated
+here rather than presented as something more rigorous than it is.
+
+COST: "$0" IS AN ARCHITECTURAL FACT, NOT A MEASUREMENT
+------------------------------------------------------------------------
+Confirmed directly with the user before implementation: the README
+states cost is $0 across all tiers "by construction" -- no paid API
+anywhere in the architecture. This is true whether or not a tier has
+been built yet, so all three rows show `cost="$0"`, while
+precision/recall/precision_at_10/median_runtime_ms stay `None` for the
+two not-yet-built rows, since those genuinely require running the tier.
+"""
+
+from __future__ import annotations
+
+import statistics
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from . import evaluation
+from .blocks import detect_blocks
+from .depgraph import build_graph
+from .parser import parse_workbook
+
+TIER_0_LABEL = "Tier 0 (rules only)"
+TIER_0_1_LABEL = "Tier 0 + 1 (+ trained classifier)"
+TIER_0_1_2_LABEL = "Tier 0 + 1 + 2 (+ local LLM)"
+
+_ARCHITECTURAL_COST = "$0"
+_BLOCKED_NOTE = (
+    "Blocked -- see CONTRIBUTING.md's Week 5 design note. The corpus can't yet support a real "
+    "4-way fine-tune (2 of 4 labels have zero examples); corpus expansion is a separate, "
+    "explicitly-scoped prerequisite task, deferred by direct user decision, not started here."
+)
+
+
+@dataclass(frozen=True)
+class AblationRow:
+    configuration: str
+    status: str  # "measured" | "not_yet_available"
+    precision: float | None
+    recall: float | None
+    precision_at_10: float | None
+    cost: str
+    median_runtime_ms: float | None
+    notes: str
+
+    def to_dict(self) -> dict:
+        return {
+            "configuration": self.configuration,
+            "status": self.status,
+            "precision": self.precision,
+            "recall": self.recall,
+            "precision_at_10": self.precision_at_10,
+            "cost": self.cost,
+            "median_runtime_ms": self.median_runtime_ms,
+            "notes": self.notes,
+        }
+
+
+@dataclass
+class AblationTable:
+    rows: list[AblationRow] = field(default_factory=list)
+    caveat: str = evaluation.INTERNAL_CONSISTENCY_CAVEAT
+
+    def to_dict(self) -> dict:
+        return {"caveat": self.caveat, "rows": [r.to_dict() for r in self.rows]}
+
+
+def _aggregate_tier0_metrics(report: evaluation.EvaluationReport) -> tuple[float | None, float | None, float | None]:
+    """Micro-averaged precision/recall across all rule rollups, plus the
+    approximate weighted-average precision@10 (see module docstring).
+    Reads only RuleRollup's public fields -- never reaches into
+    evaluation.py's private scoring internals.
+    """
+    total_tp = sum(r.tp for r in report.rollups)
+    total_fp = sum(r.fp for r in report.rollups)
+    total_fn = sum(r.fn for r in report.rollups)
+    precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) else None
+    recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) else None
+
+    total_k = sum(r.precision_at_10_k for r in report.rollups)
+    total_tp_in_top_k = sum(
+        round(r.precision_at_10 * r.precision_at_10_k) for r in report.rollups if r.precision_at_10 is not None
+    )
+    precision_at_10 = total_tp_in_top_k / total_k if total_k else None
+
+    return precision, recall, precision_at_10
+
+
+def _time_full_pipeline_per_entry(corpus_dir: Path, rules: dict) -> list[float]:
+    """One elapsed-ms sample per corpus entry, timing the full pipeline
+    (parse -> graph -> blocks -> all rule evaluations) fresh each time.
+    See module docstring for exactly what this does and doesn't cover.
+    """
+    samples: list[float] = []
+    for gt_path in sorted(corpus_dir.glob("*.ground_truth.json")):
+        name = gt_path.stem.removesuffix(".ground_truth")
+        xlsx_path = corpus_dir / f"{name}.xlsx"
+
+        start = time.perf_counter()
+        parsed = parse_workbook(xlsx_path)
+        graph = build_graph(parsed)
+        sheet_blocks = detect_blocks(parsed, graph)
+        for rule in rules.values():
+            evaluation.evaluate_rule(rule, sheet_blocks, graph)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        samples.append(elapsed_ms)
+
+    return samples
+
+
+def build_ablation_table(corpus_dir: Path, rules: dict | None = None) -> AblationTable:
+    rules = rules if rules is not None else evaluation.DEFAULT_RULES
+    report = evaluation.run_evaluation(corpus_dir, rules=rules)
+    precision, recall, precision_at_10 = _aggregate_tier0_metrics(report)
+
+    runtime_samples = _time_full_pipeline_per_entry(corpus_dir, rules)
+    median_runtime_ms = statistics.median(runtime_samples) if runtime_samples else None
+
+    tier0_row = AblationRow(
+        configuration=TIER_0_LABEL,
+        status="measured",
+        precision=precision,
+        recall=recall,
+        precision_at_10=precision_at_10,
+        cost=_ARCHITECTURAL_COST,
+        median_runtime_ms=median_runtime_ms,
+        notes=f"Measured against the {len(list(corpus_dir.glob('*.ground_truth.json')))}-entry synthetic corpus.",
+    )
+    tier01_row = AblationRow(
+        configuration=TIER_0_1_LABEL,
+        status="not_yet_available",
+        precision=None,
+        recall=None,
+        precision_at_10=None,
+        cost=_ARCHITECTURAL_COST,
+        median_runtime_ms=None,
+        notes=_BLOCKED_NOTE,
+    )
+    tier012_row = AblationRow(
+        configuration=TIER_0_1_2_LABEL,
+        status="not_yet_available",
+        precision=None,
+        recall=None,
+        precision_at_10=None,
+        cost=_ARCHITECTURAL_COST,
+        median_runtime_ms=None,
+        notes="Not started -- depends on Tier 1 above; Local LLM (Tier 2) adjudicator is unbuilt.",
+    )
+
+    return AblationTable(rows=[tier0_row, tier01_row, tier012_row])
+
+
+def format_ablation_table_text(table: AblationTable) -> str:
+    lines = []
+    lines.append("=== Week 6 Ablation Table (Tier 0 measured; Tier 0+1 / Tier 0+1+2 not yet available) ===")
+    lines.append("")
+    lines.append(table.caveat)
+    lines.append("")
+
+    header = (
+        f"{'Configuration':<34}{'Precision':>10}{'Recall':>10}{'Precision@10':>14}{'Cost':>8}"
+        f"{'Median runtime/workbook':>26}"
+    )
+    lines.append(header)
+    for row in table.rows:
+        prec = f"{row.precision:.3f}" if row.precision is not None else "n/a"
+        rec = f"{row.recall:.3f}" if row.recall is not None else "n/a"
+        p10 = f"{row.precision_at_10:.3f}" if row.precision_at_10 is not None else "n/a"
+        runtime = f"{row.median_runtime_ms:.1f} ms" if row.median_runtime_ms is not None else "n/a"
+        lines.append(f"{row.configuration:<34}{prec:>10}{rec:>10}{p10:>14}{row.cost:>8}{runtime:>26}")
+    lines.append("")
+
+    for row in table.rows:
+        if row.status == "not_yet_available":
+            lines.append(f"[{row.configuration}] {row.notes}")
+
+    return "\n".join(lines)
