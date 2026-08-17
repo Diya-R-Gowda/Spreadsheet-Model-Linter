@@ -74,9 +74,12 @@ TIER_0_1_2_LABEL = "Tier 0 + 1 + 2 (+ local LLM)"
 
 _ARCHITECTURAL_COST = "$0"
 _BLOCKED_NOTE = (
-    "Blocked -- see CONTRIBUTING.md's Week 5 design note. The corpus can't yet support a real "
-    "4-way fine-tune (2 of 4 labels have zero examples); corpus expansion is a separate, "
-    "explicitly-scoped prerequisite task, deferred by direct user decision, not started here."
+    "Blocked -- see CONTRIBUTING.md's Week 5 design note. Corpus expansion (2026-08-17) closed the "
+    "original zero-example gap for 'subtotal' and made real progress on 'unknown', but "
+    "check_training_readiness() still reports 'intentional_override' and 'unknown' below the "
+    "50-per-class floor -- the former has a real, documented low ceiling in the current corpus design, "
+    "the latter a real, verified structural ceiling on its weak-evidence injection mechanisms. "
+    "Not started here; see scripts/run_labeling.py's own readiness report for exact current counts."
 )
 
 

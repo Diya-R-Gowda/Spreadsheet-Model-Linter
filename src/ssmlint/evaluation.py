@@ -27,6 +27,15 @@ ground truth for the SAME cell:
     detection quality. Tracked and reported separately rather than
     silently dropped, so the count stays visible to anyone reading the
     report, not just someone who read the investigation that decided it.
+  - ambiguous_excluded (excluded, not scored as an error; added during
+    the 2026-08-17 corpus-expansion follow-up): ground truth state is
+    "ambiguous" — a deliberately weak-evidence construction meant to
+    carry the `unknown` block-level label (see labeling.py), not a
+    Tier-0-detection failure. Tier 0 has no concept of ambiguity and
+    flags these deterministically, same as it would an injected_bug at
+    the identical shape — same reasoning as known_intentional above,
+    handled identically (own bucket, excluded from precision, reported
+    not hidden).
   - false_positive: anything else a rule flags — ground truth "clean",
     or an "injected_bug" cell belonging to a DIFFERENT rule_id (the
     wrong rule fired on someone else's bug), or (structurally never
@@ -107,7 +116,7 @@ class ScoredIssue:
     entry: str
     cell: str
     severity: str
-    outcome: str  # "true_positive" | "false_positive" | "known_intentional"
+    outcome: str  # "true_positive" | "false_positive" | "known_intentional" | "ambiguous_excluded"
 
 
 def is_clean_baseline(ground_truth: dict) -> bool:
@@ -133,6 +142,8 @@ def score_rule_on_entry(entry_name: str, issues: list[Issue], ground_truth: dict
             outcome = "true_positive"
         elif gt_cell is not None and gt_cell["state"] == "known_intentional":
             outcome = "known_intentional"
+        elif gt_cell is not None and gt_cell["state"] == "ambiguous":
+            outcome = "ambiguous_excluded"
         else:
             outcome = "false_positive"
         scored.append(ScoredIssue(entry=entry_name, cell=issue.cell, severity=issue.severity, outcome=outcome))
@@ -155,6 +166,7 @@ class SeveritySlice:
     tp: int = 0
     fp: int = 0
     known_intentional_excluded: int = 0
+    ambiguous_excluded: int = 0
 
     @property
     def precision(self) -> float | None:
@@ -168,6 +180,7 @@ class SeveritySlice:
             "tp": self.tp,
             "fp": self.fp,
             "known_intentional_excluded": self.known_intentional_excluded,
+            "ambiguous_excluded": self.ambiguous_excluded,
             "precision": self.precision,
         }
 
@@ -179,6 +192,7 @@ class RuleRollup:
     fp: int = 0
     fn: int = 0
     known_intentional_excluded: int = 0
+    ambiguous_excluded: int = 0
     precision_at_10: float | None = None
     precision_at_10_k: int = 0
 
@@ -199,6 +213,7 @@ class RuleRollup:
             "fp": self.fp,
             "fn": self.fn,
             "known_intentional_excluded": self.known_intentional_excluded,
+            "ambiguous_excluded": self.ambiguous_excluded,
             "precision": self.precision,
             "recall": self.recall,
             "precision_at_10": self.precision_at_10,
@@ -299,6 +314,8 @@ def run_evaluation(corpus_dir: Path, rules: dict[str, Rule] | None = None) -> Ev
                     slices[key].tp += 1
                 elif s.outcome == "known_intentional":
                     slices[key].known_intentional_excluded += 1
+                elif s.outcome == "ambiguous_excluded":
+                    slices[key].ambiguous_excluded += 1
                 else:
                     slices[key].fp += 1
 
@@ -310,6 +327,7 @@ def run_evaluation(corpus_dir: Path, rules: dict[str, Rule] | None = None) -> Ev
         tp = sum(slices[(rule_id, sev)].tp for sev in SEVERITIES)
         fp = sum(slices[(rule_id, sev)].fp for sev in SEVERITIES)
         known = sum(slices[(rule_id, sev)].known_intentional_excluded for sev in SEVERITIES)
+        ambiguous = sum(slices[(rule_id, sev)].ambiguous_excluded for sev in SEVERITIES)
         fn = fn_by_rule[rule_id]
 
         # known_intentional flags are excluded from the ranking pool itself, not just from
@@ -330,11 +348,18 @@ def run_evaluation(corpus_dir: Path, rules: dict[str, Rule] | None = None) -> Ev
         rollups.append(
             RuleRollup(
                 rule_id=rule_id, tp=tp, fp=fp, fn=fn, known_intentional_excluded=known,
-                precision_at_10=precision_at_10, precision_at_10_k=k,
+                ambiguous_excluded=ambiguous, precision_at_10=precision_at_10, precision_at_10_k=k,
             )
         )
 
-    raw_flags = [s for s in clean_baseline_scored if s.outcome in ("false_positive", "known_intentional")]
+    # ambiguous_excluded counts as an expected, explained flag here too -- same treatment as
+    # known_intentional. Since corpus expansion, "clean baseline" (no injected_bug cell) now also
+    # covers subtotal/ambiguous-only entries (deliberately different-but-legitimate or
+    # deliberately weak-evidence content, not pristine models) -- is_clean_baseline's definition
+    # itself is unchanged (still just "no injected_bug cell"), but its real-world population grew.
+    raw_flags = [
+        s for s in clean_baseline_scored if s.outcome in ("false_positive", "known_intentional", "ambiguous_excluded")
+    ]
     unexplained_flags = [s for s in clean_baseline_scored if s.outcome == "false_positive"]
 
     return EvaluationReport(
@@ -354,16 +379,22 @@ def format_report_text(report: EvaluationReport) -> str:
     lines.append("")
 
     lines.append("--- Per (rule_id, severity) ---")
-    header = f"{'rule_id':<28}{'severity':<10}{'TP':>4}{'FP':>4}{'known_intentional_excl':>24}{'precision':>12}"
+    header = (
+        f"{'rule_id':<28}{'severity':<10}{'TP':>4}{'FP':>4}{'known_intentional_excl':>24}"
+        f"{'ambiguous_excl':>16}{'precision':>12}"
+    )
     lines.append(header)
     for s in report.slices:
         prec = f"{s.precision:.3f}" if s.precision is not None else "n/a"
-        lines.append(f"{s.rule_id:<28}{s.severity:<10}{s.tp:>4}{s.fp:>4}{s.known_intentional_excluded:>24}{prec:>12}")
+        lines.append(
+            f"{s.rule_id:<28}{s.severity:<10}{s.tp:>4}{s.fp:>4}{s.known_intentional_excluded:>24}"
+            f"{s.ambiguous_excluded:>16}{prec:>12}"
+        )
     lines.append("")
 
     lines.append("--- Rolled up per rule_id ---")
     header2 = (
-        f"{'rule_id':<28}{'TP':>4}{'FP':>4}{'FN':>4}{'known_intentional_excl':>24}"
+        f"{'rule_id':<28}{'TP':>4}{'FP':>4}{'FN':>4}{'known_intentional_excl':>24}{'ambiguous_excl':>16}"
         f"{'precision':>12}{'recall':>10}{'precision@10 (k)':>20}"
     )
     lines.append(header2)
@@ -372,7 +403,7 @@ def format_report_text(report: EvaluationReport) -> str:
         rec = f"{r.recall:.3f}" if r.recall is not None else "n/a"
         p10 = f"{r.precision_at_10:.3f} (k={r.precision_at_10_k})" if r.precision_at_10 is not None else "n/a"
         lines.append(
-            f"{r.rule_id:<28}{r.tp:>4}{r.fp:>4}{r.fn:>4}{r.known_intentional_excluded:>24}"
+            f"{r.rule_id:<28}{r.tp:>4}{r.fp:>4}{r.fn:>4}{r.known_intentional_excluded:>24}{r.ambiguous_excluded:>16}"
             f"{prec:>12}{rec:>10}{p10:>20}"
         )
     lines.append("")
@@ -381,12 +412,13 @@ def format_report_text(report: EvaluationReport) -> str:
     lines.append("--- Clean-baseline false positives ---")
     lines.append(f"Entries checked: {cb.entries_checked}")
     lines.append(
-        f"Raw flags (README-style, unfiltered -- includes expected known_intentional flags): {len(cb.raw_flags)}"
+        f"Raw flags (README-style, unfiltered -- includes expected known_intentional/ambiguous_excluded "
+        f"flags): {len(cb.raw_flags)}"
     )
     for s in cb.raw_flags:
         lines.append(f"  {s.entry}: {s.cell} (severity={s.severity}, outcome={s.outcome})")
     lines.append(
-        f"Unexplained flags (excluding known_intentional -- the real false-positive count): "
+        f"Unexplained flags (excluding known_intentional/ambiguous_excluded -- the real false-positive count): "
         f"{len(cb.unexplained_flags)}"
     )
     for s in cb.unexplained_flags:

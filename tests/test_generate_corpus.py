@@ -21,6 +21,7 @@ import pytest
 
 from ssmlint.blocks import detect_blocks
 from ssmlint.depgraph import build_graph
+from ssmlint.evaluation import DEFAULT_RULES, evaluate_rule
 from ssmlint.parser import parse_workbook
 from ssmlint.rules import InconsistentAnchoringRule, LiteralInBlockRule, RangeBoundaryRule, ReferenceToBlankRule
 
@@ -190,6 +191,148 @@ def test_full_corpus_sweep_ground_truth_is_internally_consistent() -> None:
         assert entry.cells
         for cell_gt in entry.cells:
             if cell_gt.state == "injected_bug":
+                assert cell_gt.rule_id in known_rule_ids
+            else:
+                assert cell_gt.rule_id is None
+
+
+def test_category_total_shape_raises_zero_issues_from_every_rule(tmp_path: Path) -> None:
+    """The subtotal shape's Total-row cells are all ground-truthed
+    "subtotal" -- a legitimate, intentionally-different aggregate, never
+    expected to be flagged. Checked at both cat_count/col_count extremes
+    and a mid-range point, not just one arbitrary size.
+    """
+    for cat_count, col_count in ((2, 3), (6, 14), (4, 8)):
+        wb, gt = generate_corpus._category_total_workbook(cat_count, col_count)
+        parsed = parse_workbook(_save(wb, tmp_path, f"category_total_{cat_count}_{col_count}"))
+        graph = build_graph(parsed)
+        sheet_blocks = detect_blocks(parsed, graph)
+
+        subtotal_cells = _cells_by_state(gt, "subtotal")
+        assert len(subtotal_cells) == col_count
+
+        for rule_id, rule in DEFAULT_RULES.items():
+            issues = evaluate_rule(rule, sheet_blocks, graph)
+            assert issues == [], f"{rule_id} unexpectedly fired on category_total({cat_count}, {col_count}): {issues}"
+
+
+def test_ambiguous_growth_chain_injection_at_n4_edge_still_gets_flagged(tmp_path: Path) -> None:
+    """n=3/edge produces no block at all (verified: only 2 clean cells
+    remain, below blocks.py's min_block_size=3) -- n=4/edge is the
+    shortest length that actually triggers a flag, so that's what the
+    "ambiguous" (unknown-label) entries use. Tier 0 has no concept of
+    ambiguity, so it must still flag these deterministically, exactly as
+    it would an injected_bug at the same shape -- only the ground-truth
+    state differs.
+    """
+    wb, gt = generate_corpus._growth_chain_workbook(4, ("literal_ambiguous", 0))
+    parsed = parse_workbook(_save(wb, tmp_path, "ambiguous_literal_edge_left"))
+    graph = build_graph(parsed)
+    sheet_blocks = detect_blocks(parsed, graph)
+
+    ambiguous_cells = _cells_by_state(gt, "ambiguous")
+    assert ambiguous_cells == {"Model!C14"}
+
+    issues = LiteralInBlockRule().evaluate(sheet_blocks)
+    assert {i.cell for i in issues} == {"Model!C14"}
+
+    wb2, gt2 = generate_corpus._growth_chain_workbook(4, ("anchoring_ambiguous", 0))
+    parsed2 = parse_workbook(_save(wb2, tmp_path, "ambiguous_anchoring_edge_left"))
+    graph2 = build_graph(parsed2)
+    sheet_blocks2 = detect_blocks(parsed2, graph2)
+
+    assert _cells_by_state(gt2, "ambiguous") == {"Model!C14"}
+    anchoring_issues = InconsistentAnchoringRule().evaluate(sheet_blocks2)
+    assert {i.cell for i in anchoring_issues} == {"Model!C14"}
+
+
+def test_variance_shape_literal_and_reference_to_blank_injections(tmp_path: Path) -> None:
+    """The variance-row shape (`=Actual-Budget`) is a genuinely different
+    two-precedent R1C1 pattern from growth-chain and trailing-sum. Its
+    literal-in-formula-block and reference-to-blank injections should
+    fire exactly the same way those rules already fire on the other two
+    shapes -- confirms the injections are correctly wired on new host
+    formulas, not just structurally plausible.
+    """
+    wb, gt = generate_corpus._variance_workbook(8, ("literal", 3))
+    parsed = parse_workbook(_save(wb, tmp_path, "variance_literal_interior"))
+    graph = build_graph(parsed)
+    sheet_blocks = detect_blocks(parsed, graph)
+
+    injected = _cells_by_state(gt, "injected_bug")
+    clean = _cells_by_state(gt, "clean")
+    assert injected == {"Variance!E6"}
+
+    issues = LiteralInBlockRule().evaluate(sheet_blocks)
+    flagged = {i.cell for i in issues}
+    assert flagged == injected
+    assert flagged.isdisjoint(clean)
+    assert issues[0].severity == "high"  # interior injection, bordered on both sides
+
+    wb2, gt2 = generate_corpus._variance_workbook(8, ("reference_to_blank", 4))
+    parsed2 = parse_workbook(_save(wb2, tmp_path, "variance_reference_to_blank"))
+    graph2 = build_graph(parsed2)
+    sheet_blocks2 = detect_blocks(parsed2, graph2)
+
+    injected2 = _cells_by_state(gt2, "injected_bug")
+    assert injected2 == {"Variance!F6"}
+    blank_issues = ReferenceToBlankRule().evaluate(sheet_blocks2, graph=graph2)
+    assert {i.cell for i in blank_issues} == injected2
+    assert blank_issues[0].severity == "high"  # exactly 1 of 8 affected -- clean majority
+
+
+def test_ambiguous_reference_to_blank_near_tie_still_gets_flagged(tmp_path: Path) -> None:
+    """One real entry from the near-tie sweep, spot-checked directly: an
+    affected/clean split close to 50/50 is still weaker evidence, not zero
+    evidence -- Tier 0 has no ambiguity concept and flags it the same as
+    any other reference-to-blank case.
+    """
+    wb, gt = generate_corpus._trailing_sum_workbook(7, ("reference_to_blank", 1))
+    ambiguous_gt = [
+        generate_corpus.CellGroundTruth(cell=c.cell, state="ambiguous", rule_id=c.rule_id, note=c.note)
+        if c.state == "injected_bug"
+        else c
+        for c in gt
+    ]
+    parsed = parse_workbook(_save(wb, tmp_path, "ambiguous_reference_to_blank_near_tie"))
+    graph = build_graph(parsed)
+    sheet_blocks = detect_blocks(parsed, graph)
+
+    ambiguous_cells = _cells_by_state(ambiguous_gt, "ambiguous")
+    assert ambiguous_cells  # this (m, blank_idx) combo does affect some members
+
+    issues = ReferenceToBlankRule().evaluate(sheet_blocks, graph=graph)
+    assert {i.cell for i in issues} == ambiguous_cells
+
+
+def test_new_shape_entries_have_internally_consistent_ground_truth() -> None:
+    """Same consistency check as the original two shapes, extended to the
+    three new entry-generating functions: every injected_bug/ambiguous
+    cell names a real rule_id, every subtotal/clean cell has none, and no
+    entry name collides with an existing one.
+    """
+    known_rule_ids = {
+        LiteralInBlockRule.rule_id,
+        RangeBoundaryRule.rule_id,
+        ReferenceToBlankRule.rule_id,
+        InconsistentAnchoringRule.rule_id,
+    }
+    generate_corpus.CORPUS_DIR.mkdir(parents=True, exist_ok=True)
+    new_entries = (
+        generate_corpus._ambiguous_growth_chain_entries()
+        + generate_corpus._category_total_entries()
+        + generate_corpus._variance_entries()
+        + generate_corpus._ambiguous_reference_to_blank_entries()
+    )
+    assert new_entries
+
+    names = [e.name for e in new_entries]
+    assert len(names) == len(set(names))
+
+    for entry in new_entries:
+        assert entry.cells
+        for cell_gt in entry.cells:
+            if cell_gt.state in ("injected_bug", "ambiguous"):
                 assert cell_gt.rule_id in known_rule_ids
             else:
                 assert cell_gt.rule_id is None

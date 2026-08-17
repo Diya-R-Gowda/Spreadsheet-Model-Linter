@@ -8,24 +8,33 @@ result as pipeline-consistency, not real-world performance. No ML
 dependency (`transformers`, `torch`, etc.) is imported or required here;
 none has been installed, per explicit instruction.
 
-WHY THIS CANNOT HONESTLY PRODUCE A REAL TRAINING SET YET (investigated
-and confirmed with the user before implementation)
+WHY THIS ORIGINALLY COULDN'T HONESTLY PRODUCE A REAL TRAINING SET
+(investigated and confirmed with the user before implementation,
+2026-08-11)
 ------------------------------------------------------------------------
-The corpus's cell-level ground truth is 3-state (clean / injected_bug /
-known_intentional); the classifier's target is a 4-state BLOCK-level
-label (subtotal | intentional_override | suspected_error | unknown).
-Only two of those four labels have any real mapping in the current
-corpus:
-  - suspected_error  <- a block touching a cell the rule engine actually
-    flagged, whose ground truth is injected_bug for that rule.
-  - intentional_override <- a block bordering a known_intentional cell
-    (a growth-chain seed literal).
-`subtotal` and `unknown` have ZERO examples anywhere in the corpus or
-pipeline -- nothing in `generate_corpus.py` builds a legitimate subtotal
-row or a genuinely ambiguous case. `label_for_block` below returns
-`None` for a block that doesn't map to either producible label, rather
-than inventing a label for it. `check_training_readiness` reports this
-gap explicitly rather than silently proceeding past it.
+The corpus's cell-level ground truth was originally 3-state (clean /
+injected_bug / known_intentional); the classifier's target is a 4-state
+BLOCK-level label (subtotal | intentional_override | suspected_error |
+unknown). Only two of those four labels had any real mapping at the
+time: suspected_error (a block touching a rule-engine-flagged
+injected_bug cell) and intentional_override (a block bordering a
+known_intentional cell). `subtotal` and `unknown` had ZERO examples
+anywhere -- nothing in `generate_corpus.py` built a legitimate subtotal
+row or a genuinely ambiguous case.
+
+CLOSED (2026-08-17): the corpus-expansion follow-up task widened
+`CellGroundTruth.state` to 5 values, adding `subtotal` (a block that IS
+a legitimate, intentionally-different aggregate -- a new category-total
+base shape) and `ambiguous` (Tier 0 still flags these deterministically,
+same predicate as an injected_bug, but they're deliberately weak-evidence
+constructions -- short block, edge position, or a near-50/50
+affected/clean split on reference-to-blank -- intended to carry the
+`unknown` label instead of `suspected_error`). `label_for_block` below
+now returns all four labels; see scripts/generate_corpus.py's own
+module docstring for exactly how each new state is constructed, and the
+real per-label volumes reported below (`unknown` in particular did not
+reach the same 50+ floor as the other three -- documented honestly, not
+padded to hit a number).
 
 DISCOVERED WHILE BUILDING THIS (not predicted by the investigation):
 `intentional_override` is even thinner than the raw ground-truth cell
@@ -133,13 +142,30 @@ def _block_deviations(block: Block) -> list[Deviation]:
 def label_for_block(
     block: Block, gt_by_cell: dict[str, dict], flagged_cells: set[str]
 ) -> tuple[str | None, str]:
-    """Determines the 4-way label for one block from the corpus's 3-state
-    cell-level ground truth. Only ever returns `suspected_error` or
-    `intentional_override` (or `None`) -- `subtotal`/`unknown` are never
-    assigned here because nothing in the corpus currently supplies real
-    evidence for either (see module docstring).
+    """Determines the 4-way label for one block from the corpus's 5-state
+    cell-level ground truth (widened from 3 states -- see
+    scripts/generate_corpus.py's corpus-expansion module docstring for
+    "subtotal" and "ambiguous"). Checked in this precedence order:
+      1. `subtotal` -- a block IS the legitimate aggregate itself; checked
+         first since it's the most direct, certain signal available (no
+         dependence on whether Tier 0 happened to flag anything).
+      2. `suspected_error` -- an `injected_bug` cell the rule engine
+         actually flagged (existing logic, unchanged).
+      3. `unknown` -- an `ambiguous` cell the rule engine flagged. Checked
+         after suspected_error deliberately: if a block somehow border
+         both a real bug and a weak-evidence case, the real bug should
+         still win, same precedence rationale as suspected_error already
+         winning over intentional_override below.
+      4. `intentional_override` -- a `known_intentional` cell (existing
+         logic, unchanged).
+      5. `None` -- no ground-truth signal maps this block to any label.
     """
     candidate_cells = list(block.cells) + [nc.cell for nc in block.non_conforming] + [nm.cell for nm in block.near_misses]
+
+    for cell in candidate_cells:
+        gt = gt_by_cell.get(cell)
+        if gt is not None and gt["state"] == "subtotal":
+            return "subtotal", f"subtotal@{cell}"
 
     for cell in candidate_cells:
         gt = gt_by_cell.get(cell)
@@ -147,6 +173,13 @@ def label_for_block(
             continue
         if gt["state"] == "injected_bug" and cell in flagged_cells:
             return "suspected_error", f"injected_bug:{gt['rule_id']}@{cell}"
+
+    for cell in candidate_cells:
+        gt = gt_by_cell.get(cell)
+        if gt is None:
+            continue
+        if gt["state"] == "ambiguous" and cell in flagged_cells:
+            return "unknown", f"ambiguous:{gt['rule_id']}@{cell}"
 
     for cell in candidate_cells:
         gt = gt_by_cell.get(cell)
@@ -330,7 +363,10 @@ def format_readiness_report(report: TrainingReadinessReport) -> str:
     lines.append(f"OVERALL: {verdict}")
     if not report.ready:
         lines.append(
-            "Expanding generate_corpus.py (subtotal + unknown examples, more base shapes for diversity, "
-            "more volume) is a separate, explicitly-scoped prerequisite task before any real training run."
+            "At least one label is below its floor -- see scripts/generate_corpus.py's module docstring "
+            "for why (e.g. 'unknown' has a real, verified structural ceiling on how many genuinely distinct "
+            "weak-evidence examples the current injection mechanisms can produce). Before training, either "
+            "accept the honestly-reported gap or extend generate_corpus.py with a new mechanism for the "
+            "specific label(s) still short."
         )
     return "\n".join(lines)

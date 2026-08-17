@@ -150,17 +150,21 @@ def test_precision_at_10_pool_excludes_known_intentional_entries() -> None:
     known_intentional) before ranking, so known_intentional entries that
     happened to sort alphabetically first could crowd real TP/FP entries
     out of the top-10 window, silently shrinking the effective k below
-    10 for reasons unrelated to ranking quality. Confirmed directly: with
-    20 known_intentional entries and 11 true positives for
-    literal-in-formula-block, the buggy version produced k=5; the fixed
-    version produces k=10. This test locks that fix in place via the
-    module's own public functions -- the real full-corpus numbers are
-    checked separately in test_full_corpus_evaluation_matches_verified_numbers.
+    10 for reasons unrelated to ranking quality. Confirmed directly on
+    the original 47-entry corpus: with 20 known_intentional entries and
+    11 true positives for literal-in-formula-block, the buggy version
+    produced k=5; the fixed version produces k=10. The exact counts below
+    reflect the current (post-corpus-expansion) corpus, not those
+    original numbers -- ambiguous_excluded, added later, is excluded from
+    the ranking pool the same way known_intentional is, for the same
+    reason. This test locks the fix in place via the module's own public
+    functions -- the real full-corpus numbers are checked separately in
+    test_full_corpus_evaluation_matches_verified_numbers.
     """
     report = run_evaluation(CORPUS_DIR)
     literal_rollup = next(r for r in report.rollups if r.rule_id == "literal-in-formula-block")
 
-    assert literal_rollup.known_intentional_excluded == 20  # confirms the crowding scenario is real, not contrived
+    assert literal_rollup.known_intentional_excluded == 22  # confirms the crowding scenario is real, not contrived
     assert literal_rollup.precision_at_10_k == PRECISION_AT_K  # not shrunk below 10 by known_intentional entries
     assert literal_rollup.precision_at_10 == 1.0
 
@@ -184,24 +188,31 @@ def test_formatted_report_includes_the_internal_consistency_caveat_verbatim() ->
 
 def test_full_corpus_evaluation_matches_verified_numbers() -> None:
     """Locks in the exact numbers verified by hand via
-    scripts/run_evaluation.py against the real 47-entry corpus.
+    scripts/run_evaluation.py against the real, post-corpus-expansion
+    144-entry corpus (originally 47 entries; growing it added subtotal,
+    ambiguous, and variance-shape entries -- see
+    scripts/generate_corpus.py's module docstring). Every original
+    47-entry injection is untouched, so precision/recall stay 1.0/1.0
+    exactly as before; only the exclusion-bucket counts and clean-baseline
+    entry count grew, since subtotal/ambiguous entries have no
+    injected_bug cell and so count as "clean baselines" under
+    is_clean_baseline's existing (unchanged) definition.
     """
     report = run_evaluation(CORPUS_DIR)
     rollups_by_id = {r.rule_id: r for r in report.rollups}
 
     expected = {
-        "literal-in-formula-block": (11, 0, 0, 20),
-        "range-boundary-mismatch": (10, 0, 0, 0),
-        "reference-to-blank": (17, 0, 0, 0),
-        "inconsistent-anchoring": (10, 0, 0, 0),
+        "literal-in-formula-block": (21, 0, 0, 22, 4),
+        "range-boundary-mismatch": (10, 0, 0, 0, 0),
+        "reference-to-blank": (20, 0, 0, 0, 39),
+        "inconsistent-anchoring": (10, 0, 0, 0, 2),
     }
-    for rule_id, (tp, fp, fn, known) in expected.items():
+    for rule_id, (tp, fp, fn, known, ambiguous) in expected.items():
         r = rollups_by_id[rule_id]
-        assert (r.tp, r.fp, r.fn, r.known_intentional_excluded) == (tp, fp, fn, known)
+        assert (r.tp, r.fp, r.fn, r.known_intentional_excluded, r.ambiguous_excluded) == (tp, fp, fn, known, ambiguous)
         assert r.precision == 1.0
         assert r.recall == 1.0
 
-    assert report.clean_baseline.entries_checked == 10
-    assert len(report.clean_baseline.raw_flags) == 5
+    assert report.clean_baseline.entries_checked == 94
+    assert len(report.clean_baseline.raw_flags) == 52
     assert len(report.clean_baseline.unexplained_flags) == 0
-    assert all(f.cell == "Model!B14" for f in report.clean_baseline.raw_flags)
