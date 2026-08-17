@@ -280,9 +280,21 @@ def _load_corpus_entries(corpus_dir: Path) -> list[tuple[str, Path, dict]]:
     return entries
 
 
-def run_evaluation(corpus_dir: Path, rules: dict[str, Rule] | None = None) -> EvaluationReport:
+def run_evaluation(
+    corpus_dir: Path, rules: dict[str, Rule] | None = None, entry_names: set[str] | None = None
+) -> EvaluationReport:
+    """`entry_names`, when given, restricts scoring to only those corpus
+    entries (by their entry name, e.g. "range_boundary__edge_left__n4") --
+    used by classifier.py to re-score Tier 0 on only a held-out test
+    split, for a fair Tier 0 vs. Tier 0+1 comparison (Week 5's own design
+    note: the full-corpus number can't be reused as-is for that
+    comparison). `None` (the default) preserves the original whole-corpus
+    behavior exactly -- every existing call site is unaffected.
+    """
     rules = rules if rules is not None else DEFAULT_RULES
     entries = _load_corpus_entries(corpus_dir)
+    if entry_names is not None:
+        entries = [e for e in entries if e[0] in entry_names]
     if not entries:
         raise ValueError(f"No corpus entries found in {corpus_dir} -- run scripts/generate_corpus.py first")
 

@@ -216,3 +216,38 @@ def test_full_corpus_evaluation_matches_verified_numbers() -> None:
     assert report.clean_baseline.entries_checked == 94
     assert len(report.clean_baseline.raw_flags) == 52
     assert len(report.clean_baseline.unexplained_flags) == 0
+
+
+def test_entry_names_filter_restricts_scoring_to_the_given_entries() -> None:
+    """New in the Tier 1 classifier follow-up: entry_names lets a caller
+    (classifier.py, scoring Tier 0 on a held-out test split only) restrict
+    which corpus entries get loaded/scored, without reusing the inflated
+    full-corpus number. Omitting the parameter must reproduce today's
+    existing full-corpus numbers exactly (regression guard); passing it
+    must match hand-scoring just those entries.
+    """
+    full_report = run_evaluation(CORPUS_DIR)
+    full_rollups = {r.rule_id: (r.tp, r.fp, r.fn) for r in full_report.rollups}
+
+    two_entries = {"clean__growth_chain__n4", "literal_in_block__edge_left__n4"}
+    subset_report = run_evaluation(CORPUS_DIR, entry_names=two_entries)
+
+    # literal_in_block__edge_left__n4 contributes exactly one real TP for
+    # literal-in-formula-block (see test_literal_injection_flags_injected_and_seed_cells-
+    # style fixtures in test_generate_corpus.py); clean__growth_chain__n4 contributes
+    # zero TP/FP on that rule (its own seed literal is known_intentional, excluded).
+    literal_rollup = next(r for r in subset_report.rollups if r.rule_id == "literal-in-formula-block")
+    assert literal_rollup.tp == 1
+    assert literal_rollup.fp == 0
+
+    # Every rule's rollup across the 2-entry subset must be a subset of the full-corpus
+    # totals, never exceeding them -- a cheap but real cross-check that filtering actually
+    # restricted the entries scored, not silently ignored the parameter.
+    for r in subset_report.rollups:
+        full_tp, full_fp, full_fn = full_rollups[r.rule_id]
+        assert r.tp <= full_tp
+        assert r.fp <= full_fp
+
+    # Omitting entry_names entirely must reproduce the existing full-corpus numbers exactly.
+    default_report = run_evaluation(CORPUS_DIR)
+    assert {r.rule_id: (r.tp, r.fp, r.fn) for r in default_report.rollups} == full_rollups

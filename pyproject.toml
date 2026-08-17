@@ -18,6 +18,10 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
+classifier = [
+    "torch>=2.0",
+    "transformers>=4.40",
+]
 
 [project.scripts]
 ssmlint = "ssmlint.cli:main"
