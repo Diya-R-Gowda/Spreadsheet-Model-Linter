@@ -139,6 +139,19 @@ def _block_deviations(block: Block) -> list[Deviation]:
     return deviations
 
 
+def candidate_cells(block: Block) -> list[str]:
+    """A block's own members plus its immediate deviation neighbors
+    (non_conforming + near_misses) -- every cell a ground-truth or
+    predicted label for this block could plausibly apply to. Promoted out
+    of `label_for_block`'s original inline logic (2026-08-11) so
+    `classifier.py`'s `apply_tier1` (2026-08-17 Tier 1 follow-up) can
+    reuse the identical cell-scope when suppressing Tier 0 issues for a
+    block predicted `subtotal`/`intentional_override` -- the same cells
+    that would have earned that block its label in the first place.
+    """
+    return list(block.cells) + [nc.cell for nc in block.non_conforming] + [nm.cell for nm in block.near_misses]
+
+
 def label_for_block(
     block: Block, gt_by_cell: dict[str, dict], flagged_cells: set[str]
 ) -> tuple[str | None, str]:
@@ -160,28 +173,28 @@ def label_for_block(
          logic, unchanged).
       5. `None` -- no ground-truth signal maps this block to any label.
     """
-    candidate_cells = list(block.cells) + [nc.cell for nc in block.non_conforming] + [nm.cell for nm in block.near_misses]
+    candidates = candidate_cells(block)
 
-    for cell in candidate_cells:
+    for cell in candidates:
         gt = gt_by_cell.get(cell)
         if gt is not None and gt["state"] == "subtotal":
             return "subtotal", f"subtotal@{cell}"
 
-    for cell in candidate_cells:
+    for cell in candidates:
         gt = gt_by_cell.get(cell)
         if gt is None:
             continue
         if gt["state"] == "injected_bug" and cell in flagged_cells:
             return "suspected_error", f"injected_bug:{gt['rule_id']}@{cell}"
 
-    for cell in candidate_cells:
+    for cell in candidates:
         gt = gt_by_cell.get(cell)
         if gt is None:
             continue
         if gt["state"] == "ambiguous" and cell in flagged_cells:
             return "unknown", f"ambiguous:{gt['rule_id']}@{cell}"
 
-    for cell in candidate_cells:
+    for cell in candidates:
         gt = gt_by_cell.get(cell)
         if gt is not None and gt["state"] == "known_intentional":
             return "intentional_override", f"known_intentional@{cell}"
@@ -197,6 +210,31 @@ def _load_corpus_entries(corpus_dir: Path) -> list[tuple[str, Path, dict]]:
         ground_truth = json.loads(gt_path.read_text(encoding="utf-8"))
         entries.append((name, xlsx_path, ground_truth))
     return entries
+
+
+def build_block_example(
+    entry: str, block: Block, base_shape: str, label: str | None = None, label_basis: str = "unlabeled"
+) -> BlockExample:
+    """Builds one README-shaped `BlockExample` from a real `Block` --
+    promoted out of `generate_labeled_examples`'s original inline
+    construction (2026-08-11) so `classifier.py`'s prediction path
+    (2026-08-17 Tier 1 follow-up) can build the identical input
+    representation for an arbitrary new block with no ground truth
+    (`label=None, label_basis="unlabeled"` by default), not just corpus
+    entries with known labels.
+    """
+    return BlockExample(
+        entry=entry,
+        block_address=f"{block.sheet}!{block.span}",
+        base_shape=base_shape,
+        formula_pattern=block.pattern,
+        conforming_count=len(block.cells),
+        deviations=_block_deviations(block),
+        row_label=None,
+        col_labels=None,
+        label=label,
+        label_basis=label_basis,
+    )
 
 
 def generate_labeled_examples(corpus_dir: Path, rules: dict[str, Rule] | None = None) -> list[BlockExample]:
@@ -224,20 +262,7 @@ def generate_labeled_examples(corpus_dir: Path, rules: dict[str, Rule] | None = 
         for sb in sheet_blocks:
             for block in sb.blocks:
                 label, basis = label_for_block(block, gt_by_cell, flagged_cells)
-                examples.append(
-                    BlockExample(
-                        entry=name,
-                        block_address=f"{block.sheet}!{block.span}",
-                        base_shape=ground_truth["base_shape"],
-                        formula_pattern=block.pattern,
-                        conforming_count=len(block.cells),
-                        deviations=_block_deviations(block),
-                        row_label=None,
-                        col_labels=None,
-                        label=label,
-                        label_basis=basis,
-                    )
-                )
+                examples.append(build_block_example(name, block, ground_truth["base_shape"], label, basis))
 
     return examples
 
