@@ -81,6 +81,12 @@ _BLOCKED_NOTE = (
     "the latter a real, verified structural ceiling on its weak-evidence injection mechanisms. "
     "Not started here; see scripts/run_labeling.py's own readiness report for exact current counts."
 )
+_NO_CHECKPOINT_NOTE = (
+    "Not measured this run -- pass tier1_checkpoint_dir (scripts/run_ablation.py's "
+    "--tier1-checkpoint flag) to a real checkpoint from scripts/train_classifier.py to fill "
+    "this row in. A real trained checkpoint now exists (see CONTRIBUTING.md); this row is "
+    "just not wired up unless the flag is actually passed."
+)
 
 
 @dataclass(frozen=True)
@@ -116,21 +122,26 @@ class AblationTable:
         return {"caveat": self.caveat, "rows": [r.to_dict() for r in self.rows]}
 
 
-def _aggregate_tier0_metrics(report: evaluation.EvaluationReport) -> tuple[float | None, float | None, float | None]:
+def _aggregate_tier0_metrics(
+    rollups: list[evaluation.RuleRollup],
+) -> tuple[float | None, float | None, float | None]:
     """Micro-averaged precision/recall across all rule rollups, plus the
     approximate weighted-average precision@10 (see module docstring).
     Reads only RuleRollup's public fields -- never reaches into
-    evaluation.py's private scoring internals.
+    evaluation.py's private scoring internals. Takes a plain rollup list
+    (not a full EvaluationReport) so it works equally for Week 4's
+    full-corpus Tier 0 rollups and classifier.evaluate_tier0_plus_1's
+    Tier 0+1 rollups, which have no EvaluationReport wrapper of their own.
     """
-    total_tp = sum(r.tp for r in report.rollups)
-    total_fp = sum(r.fp for r in report.rollups)
-    total_fn = sum(r.fn for r in report.rollups)
+    total_tp = sum(r.tp for r in rollups)
+    total_fp = sum(r.fp for r in rollups)
+    total_fn = sum(r.fn for r in rollups)
     precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) else None
     recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) else None
 
-    total_k = sum(r.precision_at_10_k for r in report.rollups)
+    total_k = sum(r.precision_at_10_k for r in rollups)
     total_tp_in_top_k = sum(
-        round(r.precision_at_10 * r.precision_at_10_k) for r in report.rollups if r.precision_at_10 is not None
+        round(r.precision_at_10 * r.precision_at_10_k) for r in rollups if r.precision_at_10 is not None
     )
     precision_at_10 = total_tp_in_top_k / total_k if total_k else None
 
@@ -159,10 +170,22 @@ def _time_full_pipeline_per_entry(corpus_dir: Path, rules: dict) -> list[float]:
     return samples
 
 
-def build_ablation_table(corpus_dir: Path, rules: dict | None = None) -> AblationTable:
+def build_ablation_table(
+    corpus_dir: Path, rules: dict | None = None, tier1_checkpoint_dir: Path | None = None
+) -> AblationTable:
+    """`tier1_checkpoint_dir`, when given (a real checkpoint saved by
+    `scripts/train_classifier.py`), fills in the Tier 0+1 row for real:
+    Tier 0+1 is scored via `classifier.evaluate_tier0_plus_1` on the
+    checkpoint's own recorded held-out test split, compared fairly
+    against Tier 0 alone re-scored on that SAME test split (per Week 5's
+    design note -- the full-corpus Tier 0 row above is a different,
+    larger, and not directly comparable number). Omitting the parameter
+    (the default) preserves the exact prior behavior -- every existing
+    caller/test is unaffected.
+    """
     rules = rules if rules is not None else evaluation.DEFAULT_RULES
     report = evaluation.run_evaluation(corpus_dir, rules=rules)
-    precision, recall, precision_at_10 = _aggregate_tier0_metrics(report)
+    precision, recall, precision_at_10 = _aggregate_tier0_metrics(report.rollups)
 
     runtime_samples = _time_full_pipeline_per_entry(corpus_dir, rules)
     median_runtime_ms = statistics.median(runtime_samples) if runtime_samples else None
@@ -177,16 +200,45 @@ def build_ablation_table(corpus_dir: Path, rules: dict | None = None) -> Ablatio
         median_runtime_ms=median_runtime_ms,
         notes=f"Measured against the {len(list(corpus_dir.glob('*.ground_truth.json')))}-entry synthetic corpus.",
     )
-    tier01_row = AblationRow(
-        configuration=TIER_0_1_LABEL,
-        status="not_yet_available",
-        precision=None,
-        recall=None,
-        precision_at_10=None,
-        cost=_ARCHITECTURAL_COST,
-        median_runtime_ms=None,
-        notes=_BLOCKED_NOTE,
-    )
+
+    if tier1_checkpoint_dir is not None:
+        from . import classifier
+
+        tier01_rollups, test_entries = classifier.evaluate_tier0_plus_1(corpus_dir, tier1_checkpoint_dir, rules=rules)
+        tier01_precision, tier01_recall, tier01_precision_at_10 = _aggregate_tier0_metrics(tier01_rollups)
+
+        tier0_test_report = evaluation.run_evaluation(corpus_dir, rules=rules, entry_names=set(test_entries))
+        tier0_test_precision, tier0_test_recall, tier0_test_precision_at_10 = _aggregate_tier0_metrics(
+            tier0_test_report.rollups
+        )
+
+        tier01_row = AblationRow(
+            configuration=TIER_0_1_LABEL,
+            status="measured",
+            precision=tier01_precision,
+            recall=tier01_recall,
+            precision_at_10=tier01_precision_at_10,
+            cost=_ARCHITECTURAL_COST,
+            median_runtime_ms=None,  # classifier inference latency not measured this pass -- a real, stated gap
+            notes=(
+                f"Measured on the {len(test_entries)}-entry held-out test split from {tier1_checkpoint_dir}. "
+                f"Tier 0 ALONE on this same test split (the fair comparison point, not the full-corpus row "
+                f"above): precision={tier0_test_precision if tier0_test_precision is not None else 'n/a'}, "
+                f"recall={tier0_test_recall if tier0_test_recall is not None else 'n/a'}."
+            ),
+        )
+    else:
+        tier01_row = AblationRow(
+            configuration=TIER_0_1_LABEL,
+            status="not_yet_available",
+            precision=None,
+            recall=None,
+            precision_at_10=None,
+            cost=_ARCHITECTURAL_COST,
+            median_runtime_ms=None,
+            notes=_NO_CHECKPOINT_NOTE,
+        )
+
     tier012_row = AblationRow(
         configuration=TIER_0_1_2_LABEL,
         status="not_yet_available",
@@ -202,8 +254,17 @@ def build_ablation_table(corpus_dir: Path, rules: dict | None = None) -> Ablatio
 
 
 def format_ablation_table_text(table: AblationTable) -> str:
+    measured = [r.configuration for r in table.rows if r.status == "measured"]
+    pending = [r.configuration for r in table.rows if r.status != "measured"]
+    status_summary = "; ".join(
+        part for part in [
+            f"measured: {', '.join(measured)}" if measured else "",
+            f"not yet available: {', '.join(pending)}" if pending else "",
+        ] if part
+    )
+
     lines = []
-    lines.append("=== Week 6 Ablation Table (Tier 0 measured; Tier 0+1 / Tier 0+1+2 not yet available) ===")
+    lines.append(f"=== Week 6 Ablation Table ({status_summary}) ===")
     lines.append("")
     lines.append(table.caveat)
     lines.append("")
@@ -222,7 +283,7 @@ def format_ablation_table_text(table: AblationTable) -> str:
     lines.append("")
 
     for row in table.rows:
-        if row.status == "not_yet_available":
+        if row.notes:
             lines.append(f"[{row.configuration}] {row.notes}")
 
     return "\n".join(lines)

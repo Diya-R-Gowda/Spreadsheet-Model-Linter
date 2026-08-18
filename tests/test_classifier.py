@@ -8,10 +8,16 @@ evidence -- see CONTRIBUTING.md.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+from unittest.mock import patch
+
 from ssmlint.blocks import Block, NearMissCell, NonConformingCell
-from ssmlint.classifier import ID_TO_LABEL, LABEL_TO_ID, apply_tier1, serialize_block_example
+from ssmlint.classifier import ID_TO_LABEL, LABEL_TO_ID, apply_tier1, evaluate_tier0_plus_1, serialize_block_example
 from ssmlint.labeling import LABELS, Deviation, build_block_example
 from ssmlint.rules import Issue
+
+CORPUS_DIR = Path(__file__).resolve().parent.parent / "corpus"
 
 
 def _block(cells: list[str], non_conforming: list[NonConformingCell] | None = None) -> Block:
@@ -173,3 +179,60 @@ def test_mismatched_blocks_and_predictions_length_raises() -> None:
         assert False, "expected ValueError"
     except ValueError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# evaluate_tier0_plus_1: real corpus entries, mocked classifier (no torch,
+# no real checkpoint needed -- training itself is deliberately not part of
+# the default pytest run, see CONTRIBUTING.md)
+# ---------------------------------------------------------------------------
+
+
+def _fake_checkpoint(tmp_path: Path, test_entries: list[str]) -> Path:
+    checkpoint_dir = tmp_path / "fake_checkpoint"
+    checkpoint_dir.mkdir()
+    split = {"train": [], "val": [], "test": test_entries}
+    (checkpoint_dir / "split.json").write_text(json.dumps(split), encoding="utf-8")
+    return checkpoint_dir
+
+
+def test_evaluate_tier0_plus_1_matches_tier0_when_predictions_never_suppress(tmp_path: Path) -> None:
+    """literal_in_block__edge_left__n4 has exactly one real injected_bug
+    flag (Model!C14, already locked in by test_generate_corpus.py). If
+    every block is predicted suspected_error/unknown (never suppressed),
+    Tier 0+1 must score identically to Tier 0 alone on this entry.
+    """
+    checkpoint_dir = _fake_checkpoint(tmp_path, ["literal_in_block__edge_left__n4"])
+
+    with (
+        patch("ssmlint.classifier.load_classifier", return_value=(object(), object())),
+        patch("ssmlint.classifier.predict_labels", return_value=["suspected_error"]),
+    ):
+        rollups, test_entries = evaluate_tier0_plus_1(CORPUS_DIR, checkpoint_dir)
+
+    assert test_entries == ["literal_in_block__edge_left__n4"]
+    literal_rollup = next(r for r in rollups if r.rule_id == "literal-in-formula-block")
+    assert literal_rollup.tp == 1
+    assert literal_rollup.fp == 0
+    assert literal_rollup.fn == 0
+
+
+def test_evaluate_tier0_plus_1_suppresses_a_real_bug_when_predicted_subtotal(tmp_path: Path) -> None:
+    """The inverse case: if the classifier (wrongly) predicts subtotal
+    for every block, the real injected_bug flag gets suppressed by
+    apply_tier1 -- Tier 0+1 must then score it as a missed bug (a false
+    negative), not silently drop it from the count entirely. This is the
+    real mechanism by which a wrong Tier 1 prediction can make Tier 0+1
+    WORSE than Tier 0 alone, not just better.
+    """
+    checkpoint_dir = _fake_checkpoint(tmp_path, ["literal_in_block__edge_left__n4"])
+
+    with (
+        patch("ssmlint.classifier.load_classifier", return_value=(object(), object())),
+        patch("ssmlint.classifier.predict_labels", return_value=["subtotal"]),
+    ):
+        rollups, _test_entries = evaluate_tier0_plus_1(CORPUS_DIR, checkpoint_dir)
+
+    literal_rollup = next(r for r in rollups if r.rule_id == "literal-in-formula-block")
+    assert literal_rollup.tp == 0
+    assert literal_rollup.fn == 1

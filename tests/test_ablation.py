@@ -21,15 +21,9 @@ from ssmlint.ablation import (
     build_ablation_table,
     format_ablation_table_text,
 )
-from ssmlint.evaluation import EvaluationReport, RuleRollup
+from ssmlint.evaluation import RuleRollup
 
 CORPUS_DIR = Path(__file__).resolve().parent.parent / "corpus"
-
-
-def _report(rollups: list[RuleRollup]) -> EvaluationReport:
-    from ssmlint.evaluation import CleanBaselineResult
-
-    return EvaluationReport(slices=[], rollups=rollups, clean_baseline=CleanBaselineResult(entries_checked=0))
 
 
 # ---------------------------------------------------------------------------
@@ -42,7 +36,7 @@ def test_aggregate_metrics_micro_averages_across_rules() -> None:
         RuleRollup(rule_id="a", tp=8, fp=2, fn=0, precision_at_10=0.8, precision_at_10_k=10),
         RuleRollup(rule_id="b", tp=2, fp=0, fn=2, precision_at_10=1.0, precision_at_10_k=2),
     ]
-    precision, recall, precision_at_10 = _aggregate_tier0_metrics(_report(rollups))
+    precision, recall, precision_at_10 = _aggregate_tier0_metrics(rollups)
 
     # precision = (8+2) / (8+2 + 2+0) = 10/12
     assert precision == 10 / 12
@@ -54,7 +48,7 @@ def test_aggregate_metrics_micro_averages_across_rules() -> None:
 
 def test_aggregate_metrics_handles_zero_denominators() -> None:
     rollups = [RuleRollup(rule_id="a", tp=0, fp=0, fn=0, precision_at_10=None, precision_at_10_k=0)]
-    precision, recall, precision_at_10 = _aggregate_tier0_metrics(_report(rollups))
+    precision, recall, precision_at_10 = _aggregate_tier0_metrics(rollups)
 
     assert precision is None
     assert recall is None
@@ -73,7 +67,7 @@ def test_aggregate_metrics_matches_known_full_corpus_totals() -> None:
         RuleRollup(rule_id="reference-to-blank", tp=17, fp=0, fn=0, precision_at_10=1.0, precision_at_10_k=10),
         RuleRollup(rule_id="inconsistent-anchoring", tp=10, fp=0, fn=0, precision_at_10=1.0, precision_at_10_k=10),
     ]
-    precision, recall, precision_at_10 = _aggregate_tier0_metrics(_report(rollups))
+    precision, recall, precision_at_10 = _aggregate_tier0_metrics(rollups)
 
     assert precision == 1.0
     assert recall == 1.0
@@ -160,3 +154,44 @@ def test_full_corpus_ablation_matches_verified_tier0_numbers() -> None:
     assert tier0.precision == 1.0
     assert tier0.recall == 1.0
     assert tier0.precision_at_10 == 1.0
+
+
+# ---------------------------------------------------------------------------
+# tier1_checkpoint_dir wiring -- mocked (no torch, no real checkpoint needed;
+# training itself is deliberately not part of the default pytest run)
+# ---------------------------------------------------------------------------
+
+
+def test_tier1_checkpoint_dir_none_preserves_existing_not_yet_available_behavior() -> None:
+    """Omitting the parameter (every existing caller/test) must reproduce
+    today's exact behavior -- a real regression guard on the new
+    optional parameter's default.
+    """
+    table = build_ablation_table(CORPUS_DIR)
+    tier01 = next(r for r in table.rows if r.configuration == TIER_0_1_LABEL)
+
+    assert tier01.status == "not_yet_available"
+    assert tier01.precision is None
+
+
+def test_tier1_checkpoint_dir_given_produces_a_measured_row_with_fair_comparison_notes() -> None:
+    fake_rollups = [
+        RuleRollup(rule_id="literal-in-formula-block", tp=1, fp=0, fn=0, precision_at_10=1.0, precision_at_10_k=1),
+    ]
+    fake_test_entries = ["literal_in_block__edge_left__n4"]
+
+    with patch("ssmlint.classifier.evaluate_tier0_plus_1", return_value=(fake_rollups, fake_test_entries)):
+        table = build_ablation_table(CORPUS_DIR, tier1_checkpoint_dir=Path("fake/checkpoint"))
+
+    tier01 = next(r for r in table.rows if r.configuration == TIER_0_1_LABEL)
+    assert tier01.status == "measured"
+    assert tier01.precision == 1.0
+    assert tier01.recall == 1.0
+    # the fair-comparison context (Tier 0 alone on the SAME test split) must be visible in the
+    # printed notes, not silently computed and discarded
+    assert "1-entry held-out test split" in tier01.notes
+    assert "Tier 0 ALONE on this same test split" in tier01.notes
+
+    text = format_ablation_table_text(table)
+    assert "[Tier 0 + 1 (+ trained classifier)]" in text
+    assert "Tier 0 ALONE on this same test split" in text

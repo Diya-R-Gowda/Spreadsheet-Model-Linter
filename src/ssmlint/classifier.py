@@ -65,6 +65,7 @@ from .blocks import Block
 from .labeling import (
     LABELS,
     BlockExample,
+    build_block_example,
     candidate_cells,
     check_training_readiness,
     format_readiness_report,
@@ -271,6 +272,8 @@ def train_classifier(corpus_dir: Path, output_dir: Path, config: TrainingConfig 
     confirmed data-readiness decision -- training proceeds on all four
     labels regardless of which ones clear the 50-per-class floor).
     """
+    import json
+
     import torch
     from torch.utils.data import Dataset
     from transformers import AutoModelForSequenceClassification, AutoTokenizer, Trainer, TrainingArguments
@@ -364,6 +367,11 @@ def train_classifier(corpus_dir: Path, output_dir: Path, config: TrainingConfig 
 
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
+    # split.json ties the checkpoint to the exact entries it was trained/evaluated on -- read
+    # back by ablation.py so a Tier 0 vs. Tier 0+1 comparison always uses the SAME test split
+    # this checkpoint's own test report used, not a freshly re-derived (and possibly different,
+    # if the corpus changed) one.
+    (output_dir / "split.json").write_text(json.dumps(split, indent=2), encoding="utf-8")
 
     test_texts, test_true_labels = _serialize_examples(test_examples)
     test_pred_labels = predict_labels(model, tokenizer, test_examples, max_length=config.max_length)
@@ -415,3 +423,114 @@ def predict_labels(model, tokenizer, examples: list[BlockExample], max_length: i
             model.train()
 
     return [ID_TO_LABEL[i] for i in predicted_ids]
+
+
+# ---------------------------------------------------------------------------
+# Tier 0 vs. Tier 0+1 comparison
+# ---------------------------------------------------------------------------
+
+
+def evaluate_tier0_plus_1(corpus_dir: Path, checkpoint_dir: Path, rules: dict | None = None):
+    """Scores Tier 0+1 (Tier 0's real issues, filtered by `apply_tier1`)
+    on only the held-out test-split entries recorded in
+    `checkpoint_dir/split.json` (written by `train_classifier` -- the
+    exact test split that checkpoint's own held-out classification
+    report used, never re-derived). The fair Tier 0 counterpart is
+    `evaluation.run_evaluation(corpus_dir, entry_names=<the same test
+    entries>)`, per Week 5's own design note that the full-corpus Tier 0
+    number can't be reused for this comparison.
+
+    Reuses `evaluation.py`'s own dataclasses and per-cell scoring
+    functions (`score_rule_on_entry`, `count_false_negatives`) rather
+    than re-deriving what counts as a true/false positive. The rollup +
+    precision@10 aggregation loop below intentionally mirrors
+    `run_evaluation`'s own (not imported directly, since that function
+    has no hook to filter issues between "Tier 0 flags them" and "score
+    them" -- duplicating this one small loop was judged lower-risk than
+    widening a completed-stage file's signature a third time this pass).
+    """
+    import json
+
+    from .blocks import detect_blocks
+    from .depgraph import build_graph
+    from .evaluation import (
+        DEFAULT_RULES,
+        PRECISION_AT_K,
+        SEVERITIES,
+        RuleRollup,
+        ScoredIssue,
+        SeveritySlice,
+        count_false_negatives,
+        evaluate_rule,
+        score_rule_on_entry,
+    )
+    from .parser import parse_workbook
+
+    rules = rules if rules is not None else DEFAULT_RULES
+    checkpoint_dir = Path(checkpoint_dir)
+    test_entries = json.loads((checkpoint_dir / "split.json").read_text(encoding="utf-8"))["test"]
+    model, tokenizer = load_classifier(checkpoint_dir)
+
+    slices: dict[tuple[str, str], SeveritySlice] = {
+        (rid, sev): SeveritySlice(rule_id=rid, severity=sev) for rid in rules for sev in SEVERITIES
+    }
+    fn_by_rule: dict[str, int] = {rid: 0 for rid in rules}
+    all_scored_by_rule: dict[str, list[ScoredIssue]] = {rid: [] for rid in rules}
+
+    for entry in sorted(test_entries):
+        xlsx_path = corpus_dir / f"{entry}.xlsx"
+        ground_truth = json.loads((corpus_dir / f"{entry}.ground_truth.json").read_text(encoding="utf-8"))
+        parsed = parse_workbook(xlsx_path)
+        graph = build_graph(parsed)
+        sheet_blocks = detect_blocks(parsed, graph)
+
+        all_issues = []
+        for rule in rules.values():
+            all_issues.extend(evaluate_rule(rule, sheet_blocks, graph))
+
+        blocks = [block for sb in sheet_blocks for block in sb.blocks]
+        block_examples = [build_block_example(entry, block, ground_truth["base_shape"]) for block in blocks]
+        predictions = predict_labels(model, tokenizer, block_examples)
+        filtered_issues = apply_tier1(all_issues, blocks, predictions)
+
+        for rule_id in rules:
+            filtered_for_rule = [i for i in filtered_issues if i.rule_id == rule_id]
+            scored = score_rule_on_entry(entry, filtered_for_rule, ground_truth, rule_id)
+            all_scored_by_rule[rule_id].extend(scored)
+            fn_by_rule[rule_id] += count_false_negatives(filtered_for_rule, ground_truth, rule_id)
+
+            for s in scored:
+                key = (rule_id, s.severity)
+                if s.outcome == "true_positive":
+                    slices[key].tp += 1
+                elif s.outcome == "known_intentional":
+                    slices[key].known_intentional_excluded += 1
+                elif s.outcome == "ambiguous_excluded":
+                    slices[key].ambiguous_excluded += 1
+                else:
+                    slices[key].fp += 1
+
+    rollups: list[RuleRollup] = []
+    for rule_id in rules:
+        tp = sum(slices[(rule_id, sev)].tp for sev in SEVERITIES)
+        fp = sum(slices[(rule_id, sev)].fp for sev in SEVERITIES)
+        known = sum(slices[(rule_id, sev)].known_intentional_excluded for sev in SEVERITIES)
+        ambiguous = sum(slices[(rule_id, sev)].ambiguous_excluded for sev in SEVERITIES)
+        fn = fn_by_rule[rule_id]
+
+        severity_rank = {"high": 0, "medium": 1}
+        scoreable = [s for s in all_scored_by_rule[rule_id] if s.outcome in ("true_positive", "false_positive")]
+        pool = sorted(scoreable, key=lambda s: (severity_rank.get(s.severity, 99), s.entry, s.cell))
+        top_k = pool[:PRECISION_AT_K]
+        k = len(top_k)
+        top_k_tp = sum(1 for s in top_k if s.outcome == "true_positive")
+        precision_at_10 = top_k_tp / k if k else None
+
+        rollups.append(
+            RuleRollup(
+                rule_id=rule_id, tp=tp, fp=fp, fn=fn, known_intentional_excluded=known,
+                ambiguous_excluded=ambiguous, precision_at_10=precision_at_10, precision_at_10_k=k,
+            )
+        )
+
+    return rollups, test_entries
