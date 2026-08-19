@@ -195,3 +195,27 @@ def test_tier1_checkpoint_dir_given_produces_a_measured_row_with_fair_comparison
     text = format_ablation_table_text(table)
     assert "[Tier 0 + 1 (+ trained classifier)]" in text
     assert "Tier 0 ALONE on this same test split" in text
+
+
+def test_tier1_checkpoint_dir_given_includes_the_intentional_override_confidence_caveat() -> None:
+    """The Tier 0+1 row's headline precision/recall must never stand alone
+    without the real, dynamic intentional_override confidence caveat sitting
+    next to it -- same standard as Tier 0's own internal-consistency caveat.
+    """
+    fake_rollups = [
+        RuleRollup(rule_id="literal-in-formula-block", tp=1, fp=0, fn=0, precision_at_10=1.0, precision_at_10_k=1),
+    ]
+    fake_test_entries = ["literal_in_block__edge_left__n4"]
+    caveat_text = "CAVEAT: intentional_override had only 1 held-out test example(s) and 0.000 recall..."
+
+    with (
+        patch("ssmlint.classifier.evaluate_tier0_plus_1", return_value=(fake_rollups, fake_test_entries)),
+        patch("ssmlint.classifier.describe_intentional_override_confidence", return_value=caveat_text),
+    ):
+        table = build_ablation_table(CORPUS_DIR, tier1_checkpoint_dir=Path("fake/checkpoint"))
+
+    tier01 = next(r for r in table.rows if r.configuration == TIER_0_1_LABEL)
+    assert caveat_text in tier01.notes
+
+    text = format_ablation_table_text(table)
+    assert caveat_text in text

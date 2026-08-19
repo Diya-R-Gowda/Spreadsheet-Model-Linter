@@ -12,9 +12,11 @@ from pathlib import Path
 from ssmlint.blocks import Block, NonConformingCell
 from ssmlint.labeling import (
     LABELS,
+    build_block_example,
     check_training_readiness,
     generate_labeled_examples,
     label_for_block,
+    labeled_entry_names,
     split_corpus_entries,
 )
 
@@ -182,6 +184,25 @@ def test_suspected_error_takes_precedence_over_intentional_override_on_the_same_
     label, _basis = label_for_block(block, gt_by_cell, flagged_cells={"Model!F14"})
 
     assert label == "suspected_error"
+
+
+# ---------------------------------------------------------------------------
+# labeled_entry_names -- the split-discrepancy fix (2026-08-19)
+# ---------------------------------------------------------------------------
+
+
+def test_labeled_entry_names_excludes_entries_with_no_labeled_block() -> None:
+    labeled = build_block_example("entry_labeled", _block(["Model!C14", "Model!D14", "Model!E14"]), "growth_chain", label="subtotal")
+    unlabeled = build_block_example("entry_unlabeled", _block(["Model!C20", "Model!D20", "Model!E20"]), "growth_chain", label=None)
+
+    assert labeled_entry_names([labeled, unlabeled]) == ["entry_labeled"]
+
+
+def test_labeled_entry_names_includes_an_entry_with_at_least_one_labeled_block() -> None:
+    one_labeled = build_block_example("entry_mixed", _block(["Model!C14", "Model!D14", "Model!E14"]), "growth_chain", label="suspected_error")
+    one_unlabeled = build_block_example("entry_mixed", _block(["Model!C20", "Model!D20", "Model!E20"]), "growth_chain", label=None)
+
+    assert labeled_entry_names([one_labeled, one_unlabeled]) == ["entry_mixed"]
 
 
 # ---------------------------------------------------------------------------

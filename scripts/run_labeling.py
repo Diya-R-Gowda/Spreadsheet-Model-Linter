@@ -22,6 +22,7 @@ from ssmlint.labeling import (  # noqa: E402
     check_training_readiness,
     format_readiness_report,
     generate_labeled_examples,
+    labeled_entry_names,
     split_corpus_entries,
 )
 
@@ -34,7 +35,7 @@ def main() -> None:
     args = parser.parse_args()
 
     examples = generate_labeled_examples(CORPUS_DIR)
-    entry_names = sorted({e.entry for e in examples})
+    entry_names = labeled_entry_names(examples)
     split = split_corpus_entries(entry_names)
     report = check_training_readiness(examples, split)
 

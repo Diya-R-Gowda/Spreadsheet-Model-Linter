@@ -267,6 +267,22 @@ def generate_labeled_examples(corpus_dir: Path, rules: dict[str, Rule] | None = 
     return examples
 
 
+def labeled_entry_names(examples: list[BlockExample]) -> list[str]:
+    """Entries with at least one labeled block -- the correct universe for
+    `split_corpus_entries`, since an entry with zero labeled blocks
+    contributes nothing to training or evaluation either way. Both
+    `classifier.train_classifier` and `scripts/run_labeling.py`'s
+    readiness report MUST derive their split from this same function --
+    computing it two different ways silently produces two DIFFERENT
+    partitions even under the same seed (a real bug found 2026-08-19:
+    `run_labeling.py`'s readiness report was describing a split
+    `train_classifier` never actually trained or evaluated on, since it
+    included entries where every block was unlabeled and `train_classifier`
+    did not).
+    """
+    return sorted({e.entry for e in examples if e.label is not None})
+
+
 def split_corpus_entries(
     entry_names: list[str], train: float = 0.7, val: float = 0.15, test: float = 0.15, seed: int = 42
 ) -> dict[str, list[str]]:
@@ -378,6 +394,14 @@ def format_readiness_report(report: TrainingReadinessReport) -> str:
     for l in report.per_label:
         status = "READY" if l.ready else "NOT READY"
         lines.append(f"  {l.label:<22} count={l.count:<4} min_required={l.min_required:<4} [{status}]")
+    lines.append("")
+    lines.append(
+        "This split is derived the SAME way scripts/train_classifier.py derives its own train/val/test "
+        "split (labeled_entry_names() -- labeled-only entries, same seed) -- so the per-split counts below "
+        "describe the actual partition a real training run uses, not an approximation (fixed 2026-08-19; "
+        "previously this script split over a different, larger entry universe and produced a genuinely "
+        "different partition than train_classifier did)."
+    )
     lines.append("")
     lines.append("--- Per-split label counts ---")
     for split_name, counts in report.per_split_label_counts.items():

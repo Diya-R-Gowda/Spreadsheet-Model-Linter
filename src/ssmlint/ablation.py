@@ -211,6 +211,7 @@ def build_ablation_table(
         tier0_test_precision, tier0_test_recall, tier0_test_precision_at_10 = _aggregate_tier0_metrics(
             tier0_test_report.rollups
         )
+        intentional_override_note = classifier.describe_intentional_override_confidence(tier1_checkpoint_dir)
 
         tier01_row = AblationRow(
             configuration=TIER_0_1_LABEL,
@@ -224,7 +225,8 @@ def build_ablation_table(
                 f"Measured on the {len(test_entries)}-entry held-out test split from {tier1_checkpoint_dir}. "
                 f"Tier 0 ALONE on this same test split (the fair comparison point, not the full-corpus row "
                 f"above): precision={tier0_test_precision if tier0_test_precision is not None else 'n/a'}, "
-                f"recall={tier0_test_recall if tier0_test_recall is not None else 'n/a'}."
+                f"recall={tier0_test_recall if tier0_test_recall is not None else 'n/a'}. "
+                f"{intentional_override_note}"
             ),
         )
     else:

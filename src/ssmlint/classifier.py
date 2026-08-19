@@ -57,6 +57,7 @@ pre-training readiness report for visibility; it is NOT a hard gate.
 
 from __future__ import annotations
 
+import json
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -70,6 +71,7 @@ from .labeling import (
     check_training_readiness,
     format_readiness_report,
     generate_labeled_examples,
+    labeled_entry_names,
     split_corpus_entries,
 )
 from .rules import Issue
@@ -137,6 +139,47 @@ def apply_tier1(issues: list[Issue], blocks: list[Block], predictions: list[str]
             suppressed_cells.update(candidate_cells(block))
 
     return [issue for issue in issues if issue.cell not in suppressed_cells]
+
+
+_THIN_TEST_SUPPORT_FLOOR = 10
+
+
+def describe_intentional_override_confidence(checkpoint_dir: Path) -> str:
+    """Real, dynamic caveat text about THIS checkpoint's actual measured
+    ability to distinguish a legitimate override from a real bug --
+    `intentional_override` is the specific judgment call Tier 1 exists for
+    per the README, so a thin/weak result on it matters more than any
+    other label. Reads `checkpoint_dir/classification_report.json`
+    (unconditionally written by `train_classifier`); never hardcodes a
+    number, so this stays accurate if a future checkpoint's
+    `intentional_override` support/recall genuinely improves. Shared by
+    both `ablation.py`'s offline comparison table and `report.py`'s live
+    single-workbook caveat -- one source of truth for this claim, not two
+    hand-maintained copies that could drift apart (see the split-
+    discrepancy bug this exact failure mode caused, fixed 2026-08-19).
+    """
+    report_path = Path(checkpoint_dir) / "classification_report.json"
+    if not report_path.exists():
+        return (
+            f"intentional_override quality UNKNOWN this run -- classification_report.json not "
+            f"found in {checkpoint_dir} (an older checkpoint, predating this file being saved)."
+        )
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    io = next((m for m in report["per_label"] if m["label"] == "intentional_override"), None)
+    if io is None:
+        return "intentional_override missing from classification_report.json -- cannot assess."
+    support, recall = io["support"], io["recall"]
+    recall_str = f"{recall:.3f}" if recall is not None else "n/a"
+    if support < _THIN_TEST_SUPPORT_FLOOR:
+        return (
+            f"CAVEAT: intentional_override had only {support} held-out test example(s) and "
+            f"{recall_str} recall in this checkpoint's own classification report -- too thin to "
+            "provide real evidence the classifier can distinguish a legitimate seed/override from "
+            "an actual bug, which is the specific judgment call Tier 1 exists for per the README. "
+            "Read any 1.000/1.000 precision/recall reported elsewhere the same way Tier 0's own "
+            "perfect score is read: as internal-consistency on this corpus, not a capability claim."
+        )
+    return f"intentional_override: {support} held-out test examples, {recall_str} recall."
 
 
 # ---------------------------------------------------------------------------
@@ -272,8 +315,6 @@ def train_classifier(corpus_dir: Path, output_dir: Path, config: TrainingConfig 
     confirmed data-readiness decision -- training proceeds on all four
     labels regardless of which ones clear the 50-per-class floor).
     """
-    import json
-
     import torch
     from torch.utils.data import Dataset
     from transformers import AutoModelForSequenceClassification, AutoTokenizer, Trainer, TrainingArguments
@@ -284,7 +325,7 @@ def train_classifier(corpus_dir: Path, output_dir: Path, config: TrainingConfig 
 
     all_examples = generate_labeled_examples(corpus_dir)
     labeled_examples = [e for e in all_examples if e.label is not None]
-    entry_names = sorted({e.entry for e in labeled_examples})
+    entry_names = labeled_entry_names(all_examples)
     split = split_corpus_entries(entry_names, seed=config.seed)
     readiness_report_text = format_readiness_report(check_training_readiness(labeled_examples, split))
 
@@ -376,6 +417,12 @@ def train_classifier(corpus_dir: Path, output_dir: Path, config: TrainingConfig 
     test_texts, test_true_labels = _serialize_examples(test_examples)
     test_pred_labels = predict_labels(model, tokenizer, test_examples, max_length=config.max_length)
     classification_report = _compute_classification_report(test_true_labels, test_pred_labels)
+    # classification_report.json is now an unconditional checkpoint artifact, not gated behind
+    # scripts/train_classifier.py's --json flag (fixed 2026-08-19) -- describe_intentional_override_
+    # confidence() below reads it to build a real, per-checkpoint caveat instead of a hand-copied one.
+    (output_dir / "classification_report.json").write_text(
+        json.dumps(classification_report.to_dict(), indent=2), encoding="utf-8"
+    )
 
     return TrainingResult(
         config=config,

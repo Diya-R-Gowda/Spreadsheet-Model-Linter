@@ -13,7 +13,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ssmlint.blocks import Block, NearMissCell, NonConformingCell
-from ssmlint.classifier import ID_TO_LABEL, LABEL_TO_ID, apply_tier1, evaluate_tier0_plus_1, serialize_block_example
+from ssmlint.classifier import (
+    ID_TO_LABEL,
+    LABEL_TO_ID,
+    apply_tier1,
+    describe_intentional_override_confidence,
+    evaluate_tier0_plus_1,
+    serialize_block_example,
+)
 from ssmlint.labeling import LABELS, Deviation, build_block_example
 from ssmlint.rules import Issue
 
@@ -236,3 +243,58 @@ def test_evaluate_tier0_plus_1_suppresses_a_real_bug_when_predicted_subtotal(tmp
     literal_rollup = next(r for r in rollups if r.rule_id == "literal-in-formula-block")
     assert literal_rollup.tp == 0
     assert literal_rollup.fn == 1
+
+
+# ---------------------------------------------------------------------------
+# describe_intentional_override_confidence -- pure file-parsing, no torch/checkpoint needed
+# ---------------------------------------------------------------------------
+
+
+def _write_classification_report(tmp_path: Path, *, support: int, recall: float | None) -> Path:
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint_dir.mkdir()
+    report = {
+        "per_label": [
+            {"label": "subtotal", "support": 7, "tp": 7, "fp": 0, "fn": 0, "precision": 1.0, "recall": 1.0, "f1": 1.0},
+            {
+                "label": "intentional_override", "support": support, "tp": 0, "fp": 0, "fn": support,
+                "precision": None, "recall": recall, "f1": None,
+            },
+        ],
+        "confusion_matrix": {},
+        "accuracy": 0.5,
+        "test_size": support + 7,
+    }
+    (checkpoint_dir / "classification_report.json").write_text(json.dumps(report), encoding="utf-8")
+    return checkpoint_dir
+
+
+def test_describe_intentional_override_confidence_thin_support_returns_explicit_caveat(tmp_path: Path) -> None:
+    checkpoint_dir = _write_classification_report(tmp_path, support=1, recall=0.0)
+
+    result = describe_intentional_override_confidence(checkpoint_dir)
+
+    assert "CAVEAT" in result
+    assert "1 held-out test example" in result
+    assert "0.000 recall" in result
+    assert "no real evidence" not in result  # exact phrasing lives in report.py's own caveat, not duplicated here
+    assert "judgment call Tier 1 exists for" in result
+
+
+def test_describe_intentional_override_confidence_ample_support_returns_plain_stats(tmp_path: Path) -> None:
+    checkpoint_dir = _write_classification_report(tmp_path, support=12, recall=0.833)
+
+    result = describe_intentional_override_confidence(checkpoint_dir)
+
+    assert result == "intentional_override: 12 held-out test examples, 0.833 recall."
+    assert "CAVEAT" not in result
+
+
+def test_describe_intentional_override_confidence_missing_file_returns_unknown(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "checkpoint_no_report"
+    checkpoint_dir.mkdir()
+
+    result = describe_intentional_override_confidence(checkpoint_dir)
+
+    assert "UNKNOWN" in result
+    assert "classification_report.json not found" in result
