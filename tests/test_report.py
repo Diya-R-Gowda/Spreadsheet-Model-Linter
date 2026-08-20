@@ -12,9 +12,11 @@ medium from LiteralInBlockRule).
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 from ssmlint.report import (
     REPORT_CAVEAT,
+    REPORT_CAVEAT_TIER1,
     build_heatmaps,
     build_report,
     rank_issues,
@@ -150,6 +152,30 @@ def test_rendered_html_shows_no_issues_message_when_empty() -> None:
     assert "No issues found." in html
 
 
+def test_rendered_html_shows_suppressed_issues_section_when_present() -> None:
+    from ssmlint.report import WorkbookReport
+
+    ranked = rank_issues([_issue("Model!H14", "high")])
+    suppressed = rank_issues([_issue("Model!B14", "medium")], tier="Tier 0 (suppressed by Tier 1)")
+    report = WorkbookReport(
+        workbook="fake.xlsx", generated_at="2026-01-01T00:00:00+00:00",
+        issues=ranked, suppressed_issues=suppressed, heatmaps=build_heatmaps(ranked),
+        severity_counts={"high": 1},
+    )
+    html = render_html(report)
+
+    assert "Suppressed by Tier 1" in html
+    assert "1 suppressed by Tier 1" in html
+    assert "Model!B14" in html
+    assert "Tier 0 (suppressed by Tier 1)" in html
+
+
+def test_rendered_html_omits_suppressed_section_when_empty() -> None:
+    report = _small_report([_issue("Model!H14", "high")])
+    html = render_html(report)
+    assert "Suppressed by Tier 1" not in html
+
+
 # ---------------------------------------------------------------------------
 # JSON output caveat -- independently asserted, not just the HTML's
 # ---------------------------------------------------------------------------
@@ -185,3 +211,58 @@ def test_build_report_against_real_fixture(fixtures_dir: Path) -> None:
     assert "B14" in hm.cells and hm.cells["B14"].severity == "medium"
 
     assert report.caveat == REPORT_CAVEAT
+
+
+# ---------------------------------------------------------------------------
+# tier1_checkpoint wiring -- mocked (no torch, no real checkpoint needed;
+# apply_tier1_to_workbook itself is unit-tested against a real model in
+# tests/test_classifier.py)
+# ---------------------------------------------------------------------------
+
+
+def test_tier1_checkpoint_none_preserves_existing_behavior_exactly(fixtures_dir: Path) -> None:
+    """Omitting the parameter (every existing caller/test) must reproduce
+    today's exact behavior -- a real regression guard on the new
+    optional parameter's default.
+    """
+    report = build_report(fixtures_dir / "revenue_row_with_hardcode.xlsx")
+
+    assert report.suppressed_issues == []
+    assert report.issues[0].tier == "Tier 0"
+    assert report.caveat == REPORT_CAVEAT
+
+
+def test_tier1_checkpoint_given_moves_suppressed_issues_to_their_own_section(fixtures_dir: Path) -> None:
+    fake_confidence_note = "intentional_override: 12 held-out test examples, 0.833 recall."
+
+    with (
+        patch(
+            "ssmlint.classifier.apply_tier1_to_workbook",
+            return_value=([Issue(cell="Model!H14", severity="high", rule_id="literal-in-formula-block",
+                                  explanation="e", suggested_fix="f")],
+                          [Issue(cell="Model!B14", severity="medium", rule_id="literal-in-formula-block",
+                                 explanation="e", suggested_fix="f")]),
+        ),
+        patch("ssmlint.classifier.describe_intentional_override_confidence", return_value=fake_confidence_note),
+    ):
+        report = build_report(fixtures_dir / "revenue_row_with_hardcode.xlsx", tier1_checkpoint="fake/checkpoint")
+
+    assert [i.cell for i in report.issues] == ["Model!H14"]
+    assert report.issues[0].tier == "Tier 0 (Tier 1-reviewed)"
+    assert [i.cell for i in report.suppressed_issues] == ["Model!B14"]
+    assert report.suppressed_issues[0].tier == "Tier 0 (suppressed by Tier 1)"
+    assert report.caveat == f"{REPORT_CAVEAT_TIER1} {fake_confidence_note}"
+    assert "Model!B14" not in [h for hm in report.heatmaps for h in hm.cells]  # suppressed cell never on the heatmap
+
+
+def test_tier1_checkpoint_bad_checkpoint_fails_loudly_not_silently(fixtures_dir: Path) -> None:
+    """A user who explicitly asked for Tier 1 review must never silently
+    get back an unmarked Tier-0-only report on a bad/missing checkpoint.
+    """
+    with patch("ssmlint.classifier.apply_tier1_to_workbook", side_effect=OSError("bad checkpoint path")):
+        try:
+            build_report(fixtures_dir / "revenue_row_with_hardcode.xlsx", tier1_checkpoint="bogus/checkpoint")
+            assert False, "expected RuntimeError"
+        except RuntimeError as exc:
+            assert "Tier 1 inference failed" in str(exc)
+            assert "bogus/checkpoint" in str(exc)

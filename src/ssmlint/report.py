@@ -66,6 +66,15 @@ REPORT_CAVEAT = (
     "in this build. Every flagged cell here deserves a human look, not automatic trust either way."
 )
 
+REPORT_CAVEAT_TIER1 = (
+    "These findings were reviewed by a trained Tier 1 classifier on top of Tier 0's structural checks. "
+    "Issues it judged a legitimate subtotal or intentional override were moved to a separate "
+    "'suppressed by Tier 1' section below, never silently dropped. The block 'base shape' Tier 1 saw "
+    "for this workbook is a heuristic guess from the block's own formula pattern (guess_base_shape), "
+    "not the rigor of the corpus's own ground truth used to train it -- read predictions on any block "
+    "guessed 'unrecognized' with extra skepticism."
+)
+
 _TEMPLATE_NAME = "report.html.jinja"
 
 
@@ -136,6 +145,7 @@ class WorkbookReport:
     workbook: str
     generated_at: str
     issues: list[RankedIssue] = field(default_factory=list)
+    suppressed_issues: list[RankedIssue] = field(default_factory=list)
     heatmaps: list[SheetHeatmap] = field(default_factory=list)
     severity_counts: dict[str, int] = field(default_factory=dict)
     rule_id_counts: dict[str, int] = field(default_factory=dict)
@@ -146,6 +156,7 @@ class WorkbookReport:
             "workbook": self.workbook,
             "generated_at": self.generated_at,
             "issues": [i.to_dict() for i in self.issues],
+            "suppressed_issues": [i.to_dict() for i in self.suppressed_issues],
             "heatmaps": [h.to_dict() for h in self.heatmaps],
             "severity_counts": self.severity_counts,
             "rule_id_counts": self.rule_id_counts,
@@ -212,7 +223,17 @@ def build_heatmaps(ranked_issues: list[RankedIssue]) -> list[SheetHeatmap]:
     return heatmaps
 
 
-def build_report(workbook_path: str | Path) -> WorkbookReport:
+def build_report(workbook_path: str | Path, tier1_checkpoint: str | Path | None = None) -> WorkbookReport:
+    """`tier1_checkpoint`, when given (a real checkpoint saved by
+    `scripts/train_classifier.py`), runs live Tier 1 inference against
+    this workbook's real Tier 0 issues (`classifier.apply_tier1_to_workbook`)
+    and splits them into surviving vs. suppressed. Omitting it (the
+    default) preserves the exact prior Tier-0-only behavior. A bad or
+    missing checkpoint fails loudly (wrapped in a `RuntimeError` naming
+    the checkpoint) rather than silently falling back to Tier 0 -- a user
+    who explicitly asked for Tier 1 review should never get an
+    unmarked-down Tier-0-only report back.
+    """
     workbook_path = Path(workbook_path)
     parsed = parse_workbook(workbook_path)
     graph = build_graph(parsed)
@@ -222,8 +243,27 @@ def build_report(workbook_path: str | Path) -> WorkbookReport:
     for rule in DEFAULT_RULES.values():
         issues.extend(evaluate_rule(rule, sheet_blocks, graph))
 
-    ranked = rank_issues(issues)
-    heatmaps = build_heatmaps(ranked)
+    if tier1_checkpoint is not None:
+        from . import classifier
+
+        try:
+            surviving_issues, suppressed_issues = classifier.apply_tier1_to_workbook(
+                issues, sheet_blocks, Path(tier1_checkpoint), workbook_name=workbook_path.name
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Tier 1 inference failed using checkpoint '{tier1_checkpoint}': {exc}") from exc
+        tier_label = "Tier 0 (Tier 1-reviewed)"
+        caveat = f"{REPORT_CAVEAT_TIER1} {classifier.describe_intentional_override_confidence(tier1_checkpoint)}"
+    else:
+        surviving_issues, suppressed_issues = issues, []
+        tier_label = "Tier 0"
+        caveat = REPORT_CAVEAT
+
+    ranked = rank_issues(surviving_issues, tier=tier_label)
+    suppressed_ranked = (
+        rank_issues(suppressed_issues, tier="Tier 0 (suppressed by Tier 1)") if suppressed_issues else []
+    )
+    heatmaps = build_heatmaps(ranked)  # unaffected -- suppressed issues never appear on the heatmap
 
     severity_counts: dict[str, int] = {}
     rule_id_counts: dict[str, int] = {}
@@ -235,9 +275,11 @@ def build_report(workbook_path: str | Path) -> WorkbookReport:
         workbook=workbook_path.name,
         generated_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
         issues=ranked,
+        suppressed_issues=suppressed_ranked,
         heatmaps=heatmaps,
         severity_counts=severity_counts,
         rule_id_counts=rule_id_counts,
+        caveat=caveat,
     )
 
 
