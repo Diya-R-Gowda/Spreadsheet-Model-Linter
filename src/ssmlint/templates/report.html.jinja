@@ -40,6 +40,8 @@
   tr.severity-medium td.sev-cell { color: var(--medium); font-weight: 600; }
   tr.hidden { display: none; }
   code { background: var(--neutral-bg); padding: 0.1rem 0.3rem; border-radius: 3px; }
+  .suppressed-table { opacity: 0.6; }
+  .suppressed-table th, .suppressed-table td { border-color: #e5e7eb; }
   footer { margin-top: 3rem; color: #6b7280; font-size: 0.85rem; border-top: 1px solid var(--border); padding-top: 1rem; }
 </style>
 </head>
@@ -56,6 +58,9 @@
   <div>{{ count }} {{ sev }}</div>
   {% endfor %}
   <div>{{ report.heatmaps|length }} sheet{{ "" if report.heatmaps|length == 1 else "s" }} with findings</div>
+  {% if report.suppressed_issues %}
+  <div>{{ report.suppressed_issues|length }} suppressed by Tier 1</div>
+  {% endif %}
 </div>
 
 <div class="filters">
@@ -103,6 +108,30 @@
 
 {% if not report.heatmaps %}
 <p>No issues found.</p>
+{% endif %}
+
+{% if report.suppressed_issues %}
+<h2>Suppressed by Tier 1</h2>
+<p>Tier 1 judged these a legitimate subtotal or intentional override, not a real error -- shown here for transparency, not hidden.</p>
+
+<table class="suppressed-table">
+  <thead>
+    <tr><th>Sheet</th><th>Cell</th><th>Severity</th><th>Rule</th><th>Tier</th><th>Explanation</th><th>Suggested fix</th></tr>
+  </thead>
+  <tbody>
+    {% for issue in report.suppressed_issues %}
+    <tr class="severity-{{ issue.severity }}" data-severity="{{ issue.severity }}">
+      <td>{{ issue.sheet }}</td>
+      <td><code>{{ issue.cell }}</code></td>
+      <td class="sev-cell">{{ issue.severity }}</td>
+      <td>{{ issue.rule_id }}</td>
+      <td>{{ issue.tier }}</td>
+      <td>{{ issue.explanation }}</td>
+      <td>{{ issue.suggested_fix }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
 {% endif %}
 
 <footer>{{ report.caveat }}</footer>
