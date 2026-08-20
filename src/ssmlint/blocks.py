@@ -104,6 +104,22 @@ parameter and collapses that case (see r1c1.py's own docstring); this
 module passes each cell's own sheet (split from its address) as that
 parameter, so the false split no longer occurs. Regression-tested in
 test_blocks.py.
+
+ROW_LABEL / COL_LABELS: A HEURISTIC, NOT A GENERAL SOLUTION (added 2026-08-20)
+------------------------------------------------------------------------
+Closes the confirmed gap that `Block`/`BlockExample` never carried the
+README's `row_label`/`col_labels` fields (they were always `None`).
+`parser.py` already captures every literal cell's text -- the gap was
+only ever that nothing linked a header cell to a `Block`. Two fixed-
+offset heuristics (`_capture_row_label`/`_capture_col_labels`, backed by
+a per-sheet `(row, col) -> CellRecord` grid built once in `detect_blocks`
+via `_full_grid`), honestly limited, not general: `row_label` only ever
+looks at column A of the block's own row (a common financial-model
+convention, but never any other column, never a multi-row-tall merged
+label); `col_labels` only ever looks exactly one row above each spanned
+column (never further up, never a multi-row header stack). Either can
+legitimately be `None`/all-`None` when a real sheet doesn't follow this
+layout -- that's the honest, expected result of a heuristic, not a bug.
 """
 
 from __future__ import annotations
@@ -166,6 +182,8 @@ class Block:
     cells: list[str] = field(default_factory=list)  # sheet-qualified, in column order
     non_conforming: list[NonConformingCell] = field(default_factory=list)
     near_misses: list[NearMissCell] = field(default_factory=list)
+    row_label: str | None = None  # heuristic: literal text at column A of this block's row, if any
+    col_labels: list[str | None] = field(default_factory=list)  # heuristic: literal text one row above, per column
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -176,6 +194,8 @@ class Block:
             "cells": self.cells,
             "non_conforming": [c.to_dict() for c in self.non_conforming],
             "near_misses": [c.to_dict() for c in self.near_misses],
+            "row_label": self.row_label,
+            "col_labels": self.col_labels,
         }
 
 
@@ -240,6 +260,47 @@ def _row_groups(sheet_name: str, cells: list[CellRecord]) -> dict[int, list[_Row
     return rows
 
 
+def _full_grid(cells: list[CellRecord]) -> dict[tuple[int, int], CellRecord]:
+    """(row, col_index) -> CellRecord for every cell parser.py captured on this
+    sheet -- built once per sheet, reused by every block on it for
+    row_label/col_labels capture below.
+    """
+    grid: dict[tuple[int, int], CellRecord] = {}
+    for record in cells:
+        _sheet, plain = _split_address(record.address)
+        col_index, row = _plain_to_col_row(plain)
+        grid[(row, col_index)] = record
+    return grid
+
+
+def _literal_text(record: CellRecord | None) -> str | None:
+    if record is not None and isinstance(record.value, str) and record.value.strip():
+        return record.value
+    return None
+
+
+def _capture_row_label(grid: dict[tuple[int, int], CellRecord], row: int) -> str | None:
+    """HEURISTIC, not a general solution: the literal text at column A
+    (col_index == 1) of the block's own row, if any -- a common financial-
+    model convention (line-item names in column A). Real, stated
+    limitation: never looks in any other column, never handles a multi-
+    row-tall merged label cell.
+    """
+    return _literal_text(grid.get((row, 1)))
+
+
+def _capture_col_labels(
+    grid: dict[tuple[int, int], CellRecord], row: int, start_col: int, end_col: int
+) -> list[str | None]:
+    """HEURISTIC, not a general solution: for each column the block spans,
+    the literal text exactly one row above, if any -- `None` per-column
+    where nothing is found (never collapsed to a single all-or-nothing
+    result). Real, stated limitation: never searches further than one row
+    up, never handles a multi-row header stack.
+    """
+    return [_literal_text(grid.get((row - 1, col))) for col in range(start_col, end_col + 1)]
+
+
 def _find_runs(row_cells: list[_RowCell]) -> list[list[_RowCell]]:
     """Maximal runs of column-consecutive cells sharing one non-None pattern."""
     runs: list[list[_RowCell]] = []
@@ -302,6 +363,7 @@ def _build_block(
     row_index: dict[int, _RowCell],
     graph: DependencyGraph,
     near_miss_threshold: float,
+    grid: dict[tuple[int, int], CellRecord],
 ) -> Block:
     pattern = run[0].pattern
     assert pattern is not None  # runs are only ever built from non-None patterns
@@ -313,6 +375,8 @@ def _build_block(
         span=f"{get_column_letter(start_col)}{row}:{get_column_letter(end_col)}{row}",
         pattern=pattern,
         cells=[rc.address for rc in run],
+        row_label=_capture_row_label(grid, row),
+        col_labels=_capture_col_labels(grid, row, start_col, end_col),
     )
 
     for neighbor_col in (start_col - 1, end_col + 1):
@@ -345,6 +409,7 @@ def detect_blocks(
 
     for sheet in parsed.sheets:
         rows = _row_groups(sheet.name, sheet.cells)
+        grid = _full_grid(sheet.cells)
         sheet_blocks = SheetBlocks(sheet=sheet.name)
 
         for row, row_cells in sorted(rows.items()):
@@ -353,7 +418,7 @@ def detect_blocks(
                 if len(run) < min_block_size:
                     continue
                 sheet_blocks.blocks.append(
-                    _build_block(sheet.name, row, run, row_index, graph, near_miss_threshold)
+                    _build_block(sheet.name, row, run, row_index, graph, near_miss_threshold, grid)
                 )
 
         result.append(sheet_blocks)

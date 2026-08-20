@@ -329,6 +329,59 @@ def test_explicit_self_sheet_reference_does_not_cause_a_false_split() -> None:
 
 
 # ---------------------------------------------------------------------------
+# row_label / col_labels: heuristic capture (2026-08-20)
+# ---------------------------------------------------------------------------
+
+
+def test_row_label_captured_from_column_a_text() -> None:
+    cells = [
+        _cell("S1!A14", value="Revenue"),
+        _cell("S1!C14", formula="=B14*(1+B15)"),
+        _cell("S1!D14", formula="=C14*(1+C15)"),
+        _cell("S1!E14", formula="=D14*(1+D15)"),
+    ]
+    block = _detect([SheetRecord(name="S1", cells=cells)])[0].blocks[0]
+    assert block.row_label == "Revenue"
+
+
+def test_col_labels_captured_from_header_row_directly_above() -> None:
+    cells = [
+        _cell("S1!C13", value="Jan"),
+        _cell("S1!D13", value="Feb"),
+        _cell("S1!E13", value="Mar"),
+        _cell("S1!C14", formula="=B14*(1+B15)"),
+        _cell("S1!D14", formula="=C14*(1+C15)"),
+        _cell("S1!E14", formula="=D14*(1+D15)"),
+    ]
+    block = _detect([SheetRecord(name="S1", cells=cells)])[0].blocks[0]
+    assert block.col_labels == ["Jan", "Feb", "Mar"]
+
+
+def test_row_label_and_col_labels_stay_none_when_no_header_text_exists() -> None:
+    cells = [
+        _cell("S1!C14", formula="=B14*(1+B15)"),
+        _cell("S1!D14", formula="=C14*(1+C15)"),
+        _cell("S1!E14", formula="=D14*(1+D15)"),
+    ]
+    block = _detect([SheetRecord(name="S1", cells=cells)])[0].blocks[0]
+    assert block.row_label is None
+    assert block.col_labels == [None, None, None]
+
+
+def test_col_labels_has_the_right_per_column_mix_when_only_some_columns_have_headers() -> None:
+    cells = [
+        _cell("S1!C13", value="Jan"),
+        # D13 deliberately has no header text
+        _cell("S1!E13", value="Mar"),
+        _cell("S1!C14", formula="=B14*(1+B15)"),
+        _cell("S1!D14", formula="=C14*(1+C15)"),
+        _cell("S1!E14", formula="=D14*(1+D15)"),
+    ]
+    block = _detect([SheetRecord(name="S1", cells=cells)])[0].blocks[0]
+    assert block.col_labels == ["Jan", None, "Mar"]
+
+
+# ---------------------------------------------------------------------------
 # Real-fixture integration: README's own C14:N14-style example
 # ---------------------------------------------------------------------------
 
@@ -349,6 +402,7 @@ def test_revenue_row_fixture(fixtures_dir: Path) -> None:
     for block in blocks:
         assert "Model!H14" not in block.cells
         assert block.pattern == "(R[0]C[-1]*(1+R[1]C[-1]))"
+        assert block.row_label == "Revenue"
 
     left_block = next(b for b in blocks if b.span == "C14:G14")
     right_block = next(b for b in blocks if b.span == "I14:M14")
@@ -360,3 +414,8 @@ def test_revenue_row_fixture(fixtures_dir: Path) -> None:
     h14_from_right = next(nc for nc in right_block.non_conforming if nc.cell == "Model!H14")
     assert h14_from_right.kind == "literal"
     assert h14_from_right.value == 4500000
+
+    # Real month-header row (13), directly above the formula row (14) -- confirms the
+    # actual parser -> grid -> block pipeline end to end, not a hand-built fixture.
+    assert left_block.col_labels == ["Feb-24", "Mar-24", "Apr-24", "May-24", "Jun-24"]
+    assert right_block.col_labels == ["Aug-24", "Sep-24", "Oct-24", "Nov-24", "Dec-24"]
