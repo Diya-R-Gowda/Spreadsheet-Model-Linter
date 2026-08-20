@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 from ssmlint.cli import main
+from ssmlint.rules import Issue
 
 
 def test_dump_to_stdout(fixtures_dir: Path, capsys) -> None:
@@ -72,3 +74,34 @@ def test_report_defaults_html_path_to_workbook_stem(fixtures_dir: Path, tmp_path
 
     default_path = tmp_path / "revenue_row_with_hardcode.report.html"
     assert default_path.exists()
+
+
+def test_report_tier1_checkpoint_flag_reports_suppressed_count(fixtures_dir: Path, tmp_path: Path, capsys) -> None:
+    html_path = tmp_path / "out.report.html"
+    json_path = tmp_path / "out.report.json"
+    fake_surviving = [Issue(cell="Model!H14", severity="high", rule_id="literal-in-formula-block",
+                             explanation="e", suggested_fix="f")]
+    fake_suppressed = [Issue(cell="Model!B14", severity="medium", rule_id="literal-in-formula-block",
+                              explanation="e", suggested_fix="f")]
+
+    with (
+        patch("ssmlint.classifier.apply_tier1_to_workbook", return_value=(fake_surviving, fake_suppressed)),
+        patch("ssmlint.classifier.describe_intentional_override_confidence", return_value="note"),
+    ):
+        exit_code = main(
+            [
+                "report",
+                str(fixtures_dir / "revenue_row_with_hardcode.xlsx"),
+                "--html", str(html_path),
+                "--json", str(json_path),
+                "--tier1-checkpoint", "fake/checkpoint",
+            ]
+        )
+    assert exit_code == 0
+
+    stdout = capsys.readouterr().out
+    assert "1 suppressed by Tier 1" in stdout
+
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    assert data["suppressed_issues"]
+    assert data["suppressed_issues"][0]["cell"] == "Model!B14"

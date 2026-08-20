@@ -23,7 +23,8 @@ def _cmd_dump(args: argparse.Namespace) -> int:
 
 
 def _cmd_report(args: argparse.Namespace) -> int:
-    report = build_report(args.path)
+    tier1_checkpoint = Path(args.tier1_checkpoint) if args.tier1_checkpoint else None
+    report = build_report(args.path, tier1_checkpoint=tier1_checkpoint)
 
     if args.json:
         Path(args.json).write_text(json.dumps(report.to_dict(), indent=2), encoding="utf-8")
@@ -34,7 +35,8 @@ def _cmd_report(args: argparse.Namespace) -> int:
     # `<stem>.report.html` in the cwd -- rather than defaulting to stdout like `dump` does.
     html_path = args.html or f"{Path(args.path).stem}.report.html"
     Path(html_path).write_text(render_html(report), encoding="utf-8")
-    print(f"Wrote HTML report to {html_path} ({len(report.issues)} issue(s) found)")
+    suppressed_suffix = f", {len(report.suppressed_issues)} suppressed by Tier 1" if report.suppressed_issues else ""
+    print(f"Wrote HTML report to {html_path} ({len(report.issues)} issue(s) found{suppressed_suffix})")
     return 0
 
 
@@ -56,6 +58,12 @@ def build_parser() -> argparse.ArgumentParser:
     report_parser.add_argument("path", help="Path to the .xlsx/.xlsm workbook")
     report_parser.add_argument("--html", help="Write the HTML report to this path (default: <stem>.report.html)")
     report_parser.add_argument("--json", help="Also write the JSON report to this path")
+    report_parser.add_argument(
+        "--tier1-checkpoint",
+        default=None,
+        help="Path to a checkpoint from scripts/train_classifier.py; suppresses/tags Tier 0 "
+        "issues using live Tier 1 inference (optional; omit for Tier 0 only)",
+    )
     report_parser.set_defaults(func=_cmd_report)
 
     return parser
