@@ -85,9 +85,18 @@ def test_serialize_includes_each_deviation_cell_kind_and_side() -> None:
 
 def test_serialize_never_includes_cell_values_or_row_col_labels() -> None:
     """Confirms the input the model sees never claims richer context than
-    the pipeline actually has -- BlockExample.row_label/col_labels are
-    always None (Week 5's confirmed input-shape gap) and no cell value
-    ever appears (BlockExample/Deviation carry no value field at all).
+    the pipeline actually has. serialize_block_example's text template
+    never references row_label/col_labels at all (a deliberate scope
+    decision, 2026-08-20: BlockExample.row_label/col_labels are now real
+    (see blocks.py's heuristic capture), but wiring them into the
+    classifier's actual input would be an unverified distribution shift
+    for the already-trained checkpoint -- a separate, retraining-aware
+    follow-up, not built here) -- and no cell value ever appears
+    (BlockExample/Deviation carry no value field at all). This test's
+    hand-built block (via the local `_block` helper, no header cells) is
+    itself a heuristic MISS: row_label stays None, col_labels stays the
+    Block dataclass default (an empty list, since _block never runs
+    through detect_blocks's real capture).
     """
     example = build_block_example(
         "entry_1",
@@ -97,9 +106,10 @@ def test_serialize_never_includes_cell_values_or_row_col_labels() -> None:
     text = serialize_block_example(example)
 
     assert "4500000" not in text
-    assert "None" not in text  # row_label/col_labels being None must never leak into the string
+    assert "row_label" not in text.lower()
+    assert "col_label" not in text.lower()
     assert example.row_label is None
-    assert example.col_labels is None
+    assert example.col_labels == []
 
 
 def test_serialize_is_deterministic() -> None:

@@ -54,19 +54,25 @@ suggest. Confirmed by running `generate_labeled_examples` for real, not
 predicted in advance -- exactly the kind of thing this plumbing check
 exists to surface.
 
-INPUT SHAPE: NO row_label/col_labels (confirmed gap, not implemented
-here)
+INPUT SHAPE: row_label/col_labels (CLOSED 2026-08-20, heuristic capture)
 ------------------------------------------------------------------------
 The README's example block description includes human-readable
-`row_label`/`col_labels` text. Neither `CellRecord` (parser.py) nor
-`Block` (blocks.py) captures any header/label text -- confirmed by
-reading both directly, not assumed. `BlockExample` below carries
-`row_label`/`col_labels` fields set to `None` on every example (kept
-visible rather than omitted, so the gap stays obvious to anyone reading
-a real example) rather than fabricating placeholder text. Extracting
-real header text would be a new pipeline capability under
-`src/ssmlint/parser.py`/`blocks.py` -- a separate, explicitly-scoped
-prerequisite task, not built here.
+`row_label`/`col_labels` text. This was originally a confirmed gap --
+neither `CellRecord` (parser.py) nor `Block` (blocks.py) captured any
+header/label text, so `BlockExample` always carried `None` for both.
+Closed by `blocks.py`'s heuristic capture (`_capture_row_label`/
+`_capture_col_labels`, see that module's own docstring for the exact
+fixed-offset heuristic and its real, stated limitations): `Block.
+row_label`/`col_labels` now carry real text when a real sheet follows
+the heuristic's assumed layout (label in column A, header row directly
+above), and `None`/all-`None` otherwise -- an honest heuristic miss, not
+a bug. `build_block_example` below passes these straight through rather
+than hardcoding `None`. NOT wired into `classifier.serialize_block_example`
+this pass (a deliberate scope decision, confirmed with the user): the
+already-trained Tier 1 checkpoint has never seen row/col label text in
+its input format, so feeding it new-shaped text now would be an
+unverified distribution shift, not a strict improvement -- a future,
+explicitly-scoped, retraining-aware follow-up, not built here.
 """
 
 from __future__ import annotations
@@ -100,8 +106,10 @@ class Deviation:
 @dataclass(frozen=True)
 class BlockExample:
     """A compact, README-shaped block description -- never a raw cell
-    dump. `row_label`/`col_labels` are always None (see module docstring:
-    the pipeline cannot produce them yet).
+    dump. `row_label`/`col_labels` come from `Block`'s own heuristic
+    capture (see module docstring's "row_label/col_labels" section) --
+    real text when the sheet follows the heuristic's assumed layout,
+    `None`/all-`None` otherwise (an honest heuristic miss, not a bug).
     """
 
     entry: str
@@ -111,7 +119,7 @@ class BlockExample:
     conforming_count: int
     deviations: list[Deviation]
     row_label: str | None
-    col_labels: list[str] | None
+    col_labels: list[str | None] | None
     label: str | None  # one of LABELS, or None if no ground-truth signal maps this block to any of them
     label_basis: str  # human-readable trace of why this label (or lack of one) was assigned
 
@@ -279,8 +287,8 @@ def build_block_example(
         formula_pattern=block.pattern,
         conforming_count=len(block.cells),
         deviations=_block_deviations(block),
-        row_label=None,
-        col_labels=None,
+        row_label=block.row_label,
+        col_labels=block.col_labels,
         label=label,
         label_basis=label_basis,
     )

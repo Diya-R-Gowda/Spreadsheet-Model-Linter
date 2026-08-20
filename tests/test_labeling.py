@@ -189,6 +189,32 @@ def test_suspected_error_takes_precedence_over_intentional_override_on_the_same_
 
 
 # ---------------------------------------------------------------------------
+# build_block_example: row_label/col_labels pass through Block's real
+# heuristic capture (2026-08-20) instead of always being None
+# ---------------------------------------------------------------------------
+
+
+def test_build_block_example_passes_through_a_blocks_real_row_and_col_labels() -> None:
+    block = Block(
+        sheet="Model", row=14, span="C14:E14", pattern="(R[0]C[-1]*(1+R1C2))",
+        cells=["Model!C14", "Model!D14", "Model!E14"],
+        row_label="Revenue", col_labels=["Jan-24", "Feb-24", None],
+    )
+    example = build_block_example("entry_1", block, "growth_chain")
+
+    assert example.row_label == "Revenue"
+    assert example.col_labels == ["Jan-24", "Feb-24", None]
+
+
+def test_build_block_example_row_and_col_labels_stay_none_when_the_block_has_none() -> None:
+    block = _block(["Model!C14", "Model!D14", "Model!E14"])  # default Block: no labels captured
+    example = build_block_example("entry_1", block, "growth_chain")
+
+    assert example.row_label is None
+    assert example.col_labels == []
+
+
+# ---------------------------------------------------------------------------
 # guess_base_shape -- the live-inference base_shape heuristic (2026-08-20)
 # ---------------------------------------------------------------------------
 
@@ -300,9 +326,14 @@ def test_full_corpus_labeling_matches_verified_numbers() -> None:
     patterns = {e.formula_pattern for e in examples}
     assert len(patterns) == 8  # up from 2 -- the variance + category-total shapes are genuinely new patterns
 
-    # row_label/col_labels must be explicitly None everywhere -- the pipeline
-    # cannot produce them yet (see module docstring); never fabricated.
-    assert all(e.row_label is None and e.col_labels is None for e in examples)
+    # The synthetic corpus's shape builders write no label text anywhere (confirmed by
+    # reading scripts/generate_corpus.py directly -- no column-A text, no header row), so
+    # even with row_label/col_labels capture now real (2026-08-20), every real corpus block
+    # is an honest heuristic MISS: row_label stays None, and col_labels is always a real
+    # list (never bare None -- _capture_col_labels always returns one entry per spanned
+    # column) whose every entry is None.
+    assert all(e.row_label is None for e in examples)
+    assert all(label is None for e in examples for label in e.col_labels)
 
 
 def test_training_readiness_is_honestly_not_ready_on_the_real_corpus() -> None:
