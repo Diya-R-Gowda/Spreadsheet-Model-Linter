@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -210,6 +211,54 @@ def _load_corpus_entries(corpus_dir: Path) -> list[tuple[str, Path, dict]]:
         ground_truth = json.loads(gt_path.read_text(encoding="utf-8"))
         entries.append((name, xlsx_path, ground_truth))
     return entries
+
+
+_GROWTH_CHAIN_RE = re.compile(r"^\(R\[0\]C\[-1\]\*\(1\+R(?:\[-?\d+\]|\d+)C(?:\[-?\d+\]|\d+)\)\)$")
+_VARIANCE_RE = re.compile(r"^\(R\[(-?\d+)\]C\[0\]-R\[(-?\d+)\]C\[0\]\)$")
+_SUM_RANGE_RE = re.compile(r"^SUM\(R\[(-?\d+)\]C\[(-?\d+)\]:R\[(-?\d+)\]C\[(-?\d+)\]\)$")
+
+UNRECOGNIZED_BASE_SHAPE = "unrecognized"
+
+
+def guess_base_shape(pattern: str) -> str:
+    """A small REGEX HEURISTIC over a block's own R1C1 `pattern` string,
+    matched against the 4 real per-block archetype shapes
+    `scripts/generate_corpus.py` produces (`growth_chain`, `trailing_sum`,
+    `category_total`, `variance`) -- NOT a trained model, and not the same
+    rigor as the corpus's own ground-truth `base_shape` (which is written
+    at synthetic-generation time, something a real workbook never has).
+
+    Built to distinguish live-inference's actual need (2026-08-20, Tier 1
+    live-report wiring): `build_block_example` requires a `base_shape` for
+    every block, but only the corpus can supply one from ground truth. A
+    real workbook's blocks are not guaranteed to be one of these 4 shapes
+    at all -- `UNRECOGNIZED_BASE_SHAPE` is the expected, honest result
+    otherwise, and predictions on `unrecognized`-shape blocks should be
+    read with extra skepticism, since that exact token never appeared in
+    the classifier's own training data (which only ever saw the 4 real
+    shape names above).
+
+    `cross_block_isolation` (a 5th corpus label) is deliberately never
+    returned here -- it's a corpus-only composite (one growth_chain block
+    plus one separate trailing_sum block on one sheet), never a real
+    per-block pattern shape of its own.
+    """
+    if _GROWTH_CHAIN_RE.match(pattern):
+        return "growth_chain"
+
+    m = _VARIANCE_RE.match(pattern)
+    if m and m.group(1) != m.group(2):
+        return "variance"
+
+    m = _SUM_RANGE_RE.match(pattern)
+    if m:
+        r1, c1, r2, c2 = m.groups()
+        if c1 == c2:
+            return "category_total"  # vertical span, same column -- a category-total aggregate
+        if r1 == r2:
+            return "trailing_sum"  # horizontal span, same row -- a fixed-width rolling sum
+
+    return UNRECOGNIZED_BASE_SHAPE
 
 
 def build_block_example(

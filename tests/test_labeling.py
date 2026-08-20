@@ -12,9 +12,11 @@ from pathlib import Path
 from ssmlint.blocks import Block, NonConformingCell
 from ssmlint.labeling import (
     LABELS,
+    UNRECOGNIZED_BASE_SHAPE,
     build_block_example,
     check_training_readiness,
     generate_labeled_examples,
+    guess_base_shape,
     label_for_block,
     labeled_entry_names,
     split_corpus_entries,
@@ -184,6 +186,44 @@ def test_suspected_error_takes_precedence_over_intentional_override_on_the_same_
     label, _basis = label_for_block(block, gt_by_cell, flagged_cells={"Model!F14"})
 
     assert label == "suspected_error"
+
+
+# ---------------------------------------------------------------------------
+# guess_base_shape -- the live-inference base_shape heuristic (2026-08-20)
+# ---------------------------------------------------------------------------
+
+
+def test_guess_base_shape_growth_chain_corpus_absolute_form() -> None:
+    assert guess_base_shape("(R[0]C[-1]*(1+R1C2))") == "growth_chain"
+
+
+def test_guess_base_shape_growth_chain_real_fixture_relative_form() -> None:
+    """revenue_row_with_hardcode.xlsx's real formula (=prev14*(1+prev15))
+    normalizes to a RELATIVE growth-rate operand, unlike the corpus's
+    absolute $B$1 form -- proves the regex isn't overfit to synthetic data.
+    """
+    assert guess_base_shape("(R[0]C[-1]*(1+R[1]C[-1]))") == "growth_chain"
+
+
+def test_guess_base_shape_trailing_sum_horizontal_range() -> None:
+    assert guess_base_shape("SUM(R[-1]C[-2]:R[-1]C[0])") == "trailing_sum"
+
+
+def test_guess_base_shape_category_total_vertical_range() -> None:
+    assert guess_base_shape("SUM(R[-13]C[0]:R[-1]C[0])") == "category_total"
+
+
+def test_guess_base_shape_variance_subtraction() -> None:
+    assert guess_base_shape("(R[-2]C[0]-R[-1]C[0])") == "variance"
+
+
+def test_guess_base_shape_variance_regex_matches_but_identical_offsets_rejected() -> None:
+    assert guess_base_shape("(R[-1]C[0]-R[-1]C[0])") == UNRECOGNIZED_BASE_SHAPE
+
+
+def test_guess_base_shape_unmatched_pattern_returns_unrecognized() -> None:
+    assert guess_base_shape("(R[0]C[-1]+R[0]C[-2])") == UNRECOGNIZED_BASE_SHAPE
+    assert guess_base_shape("AVERAGE(R[-1]C[0]:R[-3]C[0])") == UNRECOGNIZED_BASE_SHAPE
 
 
 # ---------------------------------------------------------------------------
