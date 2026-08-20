@@ -12,11 +12,12 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
-from ssmlint.blocks import Block, NearMissCell, NonConformingCell
+from ssmlint.blocks import Block, NearMissCell, NonConformingCell, SheetBlocks
 from ssmlint.classifier import (
     ID_TO_LABEL,
     LABEL_TO_ID,
     apply_tier1,
+    apply_tier1_to_workbook,
     describe_intentional_override_confidence,
     evaluate_tier0_plus_1,
     serialize_block_example,
@@ -243,6 +244,61 @@ def test_evaluate_tier0_plus_1_suppresses_a_real_bug_when_predicted_subtotal(tmp
     literal_rollup = next(r for r in rollups if r.rule_id == "literal-in-formula-block")
     assert literal_rollup.tp == 0
     assert literal_rollup.fn == 1
+
+
+# ---------------------------------------------------------------------------
+# apply_tier1_to_workbook -- live inference for one real (already-parsed)
+# workbook, mocked classifier (no torch, no real checkpoint needed)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_tier1_to_workbook_splits_issues_exhaustively_when_nothing_suppressed() -> None:
+    block = _block(["Model!C14", "Model!D14", "Model!E14"])
+    sheet_blocks = [SheetBlocks(sheet="Model", blocks=[block])]
+    issues = [_issue("Model!C14"), _issue("Model!D14")]
+
+    with (
+        patch("ssmlint.classifier.load_classifier", return_value=(object(), object())),
+        patch("ssmlint.classifier.predict_labels", return_value=["suspected_error"]),
+    ):
+        surviving, suppressed = apply_tier1_to_workbook(issues, sheet_blocks, Path("fake/checkpoint"))
+
+    assert surviving == issues
+    assert suppressed == []
+
+
+def test_apply_tier1_to_workbook_splits_issues_exhaustively_when_a_block_is_suppressed() -> None:
+    block = _block(["Model!C14", "Model!D14", "Model!E14"])
+    sheet_blocks = [SheetBlocks(sheet="Model", blocks=[block])]
+    issues = [_issue("Model!C14"), _issue("Model!D14")]
+
+    with (
+        patch("ssmlint.classifier.load_classifier", return_value=(object(), object())),
+        patch("ssmlint.classifier.predict_labels", return_value=["subtotal"]),
+    ):
+        surviving, suppressed = apply_tier1_to_workbook(issues, sheet_blocks, Path("fake/checkpoint"))
+
+    # exhaustive, non-overlapping split -- every real issue lands in exactly one of the two lists
+    assert surviving == []
+    assert {i.cell for i in suppressed} == {"Model!C14", "Model!D14"}
+    assert set(surviving) | set(suppressed) == set(issues)
+    assert set(surviving) & set(suppressed) == set()
+
+
+def test_apply_tier1_to_workbook_flattens_blocks_across_multiple_sheets() -> None:
+    block_a = _block(["Model!C14", "Model!D14", "Model!E14"])
+    block_b = _block(["Other!C14", "Other!D14", "Other!E14"])
+    sheet_blocks = [SheetBlocks(sheet="Model", blocks=[block_a]), SheetBlocks(sheet="Other", blocks=[block_b])]
+    issues = [_issue("Model!C14"), _issue("Other!C14")]
+
+    with (
+        patch("ssmlint.classifier.load_classifier", return_value=(object(), object())),
+        patch("ssmlint.classifier.predict_labels", return_value=["subtotal", "suspected_error"]),
+    ):
+        surviving, suppressed = apply_tier1_to_workbook(issues, sheet_blocks, Path("fake/checkpoint"))
+
+    assert {i.cell for i in suppressed} == {"Model!C14"}
+    assert {i.cell for i in surviving} == {"Other!C14"}
 
 
 # ---------------------------------------------------------------------------

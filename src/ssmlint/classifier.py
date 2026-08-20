@@ -62,7 +62,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
-from .blocks import Block
+from .blocks import Block, SheetBlocks
 from .labeling import (
     LABELS,
     BlockExample,
@@ -139,6 +139,37 @@ def apply_tier1(issues: list[Issue], blocks: list[Block], predictions: list[str]
             suppressed_cells.update(candidate_cells(block))
 
     return [issue for issue in issues if issue.cell not in suppressed_cells]
+
+
+def apply_tier1_to_workbook(
+    issues: list[Issue],
+    sheet_blocks: list[SheetBlocks],
+    checkpoint_dir: Path,
+    workbook_name: str = "workbook",
+) -> tuple[list[Issue], list[Issue]]:
+    """Live Tier 1 inference for one real, already-parsed workbook --
+    unlike `evaluate_tier0_plus_1` (corpus entries, known ground-truth
+    `base_shape`), each block's `base_shape` here is *guessed* by
+    `labeling.guess_base_shape` from its own R1C1 pattern: a heuristic
+    approximation, not a trained model (see its own docstring). Returns
+    `(surviving_issues, suppressed_issues)` -- unlike `apply_tier1` itself,
+    a real report needs to show BOTH halves, not silently drop what got
+    suppressed.
+    """
+    from .labeling import build_block_example, guess_base_shape
+
+    checkpoint_dir = Path(checkpoint_dir)
+    model, tokenizer = load_classifier(checkpoint_dir)
+
+    blocks = [block for sb in sheet_blocks for block in sb.blocks]
+    block_examples = [
+        build_block_example(workbook_name, block, guess_base_shape(block.pattern)) for block in blocks
+    ]
+    predictions = predict_labels(model, tokenizer, block_examples)
+    surviving = apply_tier1(issues, blocks, predictions)
+    surviving_set = set(surviving)
+    suppressed = [issue for issue in issues if issue not in surviving_set]
+    return surviving, suppressed
 
 
 _THIN_TEST_SUPPORT_FLOOR = 10
