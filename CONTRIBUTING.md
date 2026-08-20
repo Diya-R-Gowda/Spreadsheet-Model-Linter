@@ -365,3 +365,26 @@ JOBS
 ```
 
 `tests/test_packaging.py`'s real `pip wheel` subprocess test (previously flagged as a real false-pass risk on a stale local build cache) passed cleanly on every job, including the very first failing run — confirmed it was never the source of any CI failure here; the corpus-reproducibility gap was a separate, previously-unknown issue.
+
+---
+
+## row_label / col_labels capture (2026-08-20)
+
+`BlockExample.row_label`/`col_labels` had been `None` on every example since Week 5 — the README's own worked example shows real values (`"row_label": "Revenue - Enterprise"`, `"col_labels": ["Jan-24", "Feb-24", ...]`), but neither `CellRecord` nor `Block` ever captured any header text, only linked one to a block. Investigation confirmed **no parser-level gap**: `parser.py` already captures every literal cell's text (`tests/test_parser.py::test_literal_values` already asserted this); the gap was purely that `blocks.py` had no positional grid to look a header cell up with.
+
+Closed with two fixed-offset heuristics in `blocks.py`, honestly documented as heuristics (same convention as `guess_base_shape`), not a general solution: `row_label` reads column A of the block's own row; `col_labels` reads exactly one row above each spanned column. Both `None`/all-`None` when a real sheet doesn't follow that layout — an honest miss, not a bug. `labeling.build_block_example` now passes these through instead of hardcoding `None`. **Confirmed scope decision:** `classifier.serialize_block_example` is deliberately left unwired — the already-trained Tier 1 checkpoint has never seen row/col label text in its input format, so feeding it new-shaped text now would be an unverified distribution shift, not a strict improvement; wiring it in is a separate, retraining-aware follow-up.
+
+One genuinely stale test found and fixed while implementing, not just noted: `test_full_corpus_labeling_matches_verified_numbers`'s premise was "row_label/col_labels always None" — still true for `row_label` (the real corpus's shape builders write no column-A text anywhere), but `col_labels` is now a real list of `None`s per spanned column, never bare `None`, since `_capture_col_labels` always returns one entry per column regardless of whether anything was found.
+
+**Real captured output**, run against the real (non-synthetic) `revenue_row_with_hardcode.xlsx` fixture:
+
+```
+Block Model!C14:G14
+  row_label:  'Revenue'
+  col_labels: ['Feb-24', 'Mar-24', 'Apr-24', 'May-24', 'Jun-24']
+Block Model!I14:M14
+  row_label:  'Revenue'
+  col_labels: ['Aug-24', 'Sep-24', 'Oct-24', 'Nov-24', 'Dec-24']
+```
+
+251 tests passing (up from 245).
