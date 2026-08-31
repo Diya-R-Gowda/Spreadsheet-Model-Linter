@@ -59,7 +59,7 @@
   {% endfor %}
   <div>{{ report.heatmaps|length }} sheet{{ "" if report.heatmaps|length == 1 else "s" }} with findings</div>
   {% if report.suppressed_issues %}
-  <div>{{ report.suppressed_issues|length }} suppressed by Tier 1</div>
+  <div>{{ report.suppressed_issues|length }} suppressed by Tier 1/2 review</div>
   {% endif %}
 </div>
 
@@ -111,8 +111,8 @@
 {% endif %}
 
 {% if report.suppressed_issues %}
-<h2>Suppressed by Tier 1</h2>
-<p>Tier 1 judged these a legitimate subtotal or intentional override, not a real error -- shown here for transparency, not hidden.</p>
+<h2>Suppressed by Tier 1/2 review</h2>
+<p>Tier 1 and/or Tier 2 (see each row's own Tier column) judged these a legitimate subtotal or intentional override, not a real error -- shown here for transparency, not hidden.</p>
 
 <table class="suppressed-table">
   <thead>
