@@ -75,6 +75,16 @@ REPORT_CAVEAT_TIER1 = (
     "guessed 'unrecognized' with extra skepticism."
 )
 
+REPORT_CAVEAT_TIER2 = (
+    "Additionally, a local LLM adjudicator (a 3B-parameter model run via Ollama) reviewed Tier 1's "
+    "own surviving issues as a second opinion -- never a standalone judge on its own, always layered "
+    "on top of Tier 1. Its output is grammar-constrained (a JSON schema restricts it to exactly one of "
+    "the four labels; it can never invent a cell address), but unlike Tier 1 it is zero-shot -- never "
+    "fine-tuned on this project's own corpus, and has no held-out classification report of its own. "
+    "Read its suppressions with at least as much skepticism as Tier 1's; the ablation table is the "
+    "only real, measured evidence of its quality on this project's synthetic corpus."
+)
+
 _TEMPLATE_NAME = "report.html.jinja"
 
 
@@ -223,7 +233,12 @@ def build_heatmaps(ranked_issues: list[RankedIssue]) -> list[SheetHeatmap]:
     return heatmaps
 
 
-def build_report(workbook_path: str | Path, tier1_checkpoint: str | Path | None = None) -> WorkbookReport:
+def build_report(
+    workbook_path: str | Path,
+    tier1_checkpoint: str | Path | None = None,
+    tier2_model: str | None = None,
+    tier2_endpoint: str | None = None,
+) -> WorkbookReport:
     """`tier1_checkpoint`, when given (a real checkpoint saved by
     `scripts/train_classifier.py`), runs live Tier 1 inference against
     this workbook's real Tier 0 issues (`classifier.apply_tier1_to_workbook`)
@@ -233,7 +248,26 @@ def build_report(workbook_path: str | Path, tier1_checkpoint: str | Path | None 
     the checkpoint) rather than silently falling back to Tier 0 -- a user
     who explicitly asked for Tier 1 review should never get an
     unmarked-down Tier-0-only report back.
+
+    `tier2_model`, when ALSO given (e.g. "qwen2.5:3b-instruct", a real
+    local Ollama model), runs live Tier 2 inference
+    (`llm_adjudicator.apply_tier2_to_workbook`) against Tier 1's own
+    SURVIVING issues -- a second opinion layered on top, never a
+    standalone alternative (chained-only, matching `ablation.py`'s own
+    design). `tier2_model` without `tier1_checkpoint` raises `ValueError`
+    immediately, before any parsing/rule work runs. A bad checkpoint-free
+    server (unreachable Ollama, model not pulled) fails loudly the same
+    way a bad Tier 1 checkpoint does -- checked up front via
+    `llm_adjudicator.check_ollama_available` for a clearer error than a
+    raw connection-refused traceback.
     """
+    if tier2_model is not None and tier1_checkpoint is None:
+        raise ValueError(
+            "tier2_model requires tier1_checkpoint to also be given -- Tier 2 is a second opinion "
+            "layered on top of Tier 1's own predictions, never a standalone alternative (matches "
+            "ssmlint.ablation's own chained-only design)."
+        )
+
     workbook_path = Path(workbook_path)
     parsed = parse_workbook(workbook_path)
     graph = build_graph(parsed)
@@ -243,26 +277,48 @@ def build_report(workbook_path: str | Path, tier1_checkpoint: str | Path | None 
     for rule in DEFAULT_RULES.values():
         issues.extend(evaluate_rule(rule, sheet_blocks, graph))
 
+    tier1_suppressed: list[Issue] = []
+    tier2_suppressed: list[Issue] = []
+
     if tier1_checkpoint is not None:
         from . import classifier
 
         try:
-            surviving_issues, suppressed_issues = classifier.apply_tier1_to_workbook(
+            surviving_issues, tier1_suppressed = classifier.apply_tier1_to_workbook(
                 issues, sheet_blocks, Path(tier1_checkpoint), workbook_name=workbook_path.name
             )
         except Exception as exc:
             raise RuntimeError(f"Tier 1 inference failed using checkpoint '{tier1_checkpoint}': {exc}") from exc
         tier_label = "Tier 0 (Tier 1-reviewed)"
         caveat = f"{REPORT_CAVEAT_TIER1} {classifier.describe_intentional_override_confidence(tier1_checkpoint)}"
+
+        if tier2_model is not None:
+            from . import llm_adjudicator
+
+            endpoint = tier2_endpoint if tier2_endpoint is not None else llm_adjudicator.DEFAULT_OLLAMA_ENDPOINT
+            try:
+                llm_adjudicator.check_ollama_available(endpoint=endpoint, model=tier2_model)
+                surviving_issues, tier2_suppressed = llm_adjudicator.apply_tier2_to_workbook(
+                    surviving_issues, sheet_blocks, model=tier2_model, endpoint=endpoint,
+                    workbook_name=workbook_path.name,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Tier 2 inference failed using model '{tier2_model}' at '{endpoint}': {exc}"
+                ) from exc
+            tier_label = "Tier 0 (Tier 1+2-reviewed)"
+            caveat = f"{caveat} {REPORT_CAVEAT_TIER2}"
     else:
-        surviving_issues, suppressed_issues = issues, []
+        surviving_issues = issues
         tier_label = "Tier 0"
         caveat = REPORT_CAVEAT
 
     ranked = rank_issues(surviving_issues, tier=tier_label)
-    suppressed_ranked = (
-        rank_issues(suppressed_issues, tier="Tier 0 (suppressed by Tier 1)") if suppressed_issues else []
-    )
+    suppressed_ranked: list[RankedIssue] = []
+    if tier1_suppressed:
+        suppressed_ranked.extend(rank_issues(tier1_suppressed, tier="Tier 0 (suppressed by Tier 1)"))
+    if tier2_suppressed:
+        suppressed_ranked.extend(rank_issues(tier2_suppressed, tier="Tier 0 (suppressed by Tier 2)"))
     heatmaps = build_heatmaps(ranked)  # unaffected -- suppressed issues never appear on the heatmap
 
     severity_counts: dict[str, int] = {}

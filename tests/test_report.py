@@ -17,6 +17,7 @@ from unittest.mock import patch
 from ssmlint.report import (
     REPORT_CAVEAT,
     REPORT_CAVEAT_TIER1,
+    REPORT_CAVEAT_TIER2,
     build_heatmaps,
     build_report,
     rank_issues,
@@ -266,3 +267,73 @@ def test_tier1_checkpoint_bad_checkpoint_fails_loudly_not_silently(fixtures_dir:
         except RuntimeError as exc:
             assert "Tier 1 inference failed" in str(exc)
             assert "bogus/checkpoint" in str(exc)
+
+
+# ---------------------------------------------------------------------------
+# tier2_model wiring -- mocked (no real Ollama server needed; a real live run
+# is documented separately in CONTRIBUTING.md with real pasted output)
+# ---------------------------------------------------------------------------
+
+
+def test_tier2_model_given_without_tier1_checkpoint_raises(fixtures_dir: Path) -> None:
+    """Chained-only design: Tier 2 layers on top of Tier 1's own
+    predictions, never a standalone alternative."""
+    try:
+        build_report(fixtures_dir / "revenue_row_with_hardcode.xlsx", tier2_model="qwen2.5:3b-instruct")
+        assert False, "expected ValueError"
+    except ValueError as exc:
+        assert "tier1_checkpoint" in str(exc)
+
+
+def test_tier2_model_given_moves_its_own_suppressed_issues_to_their_own_tier_label(fixtures_dir: Path) -> None:
+    tier1_surviving = [
+        Issue(cell="Model!H14", severity="high", rule_id="literal-in-formula-block", explanation="e", suggested_fix="f")
+    ]
+    tier1_suppressed = [
+        Issue(cell="Model!B14", severity="medium", rule_id="literal-in-formula-block", explanation="e", suggested_fix="f")
+    ]
+    tier2_surviving: list[Issue] = []
+    tier2_suppressed = [
+        Issue(cell="Model!H14", severity="high", rule_id="literal-in-formula-block", explanation="e", suggested_fix="f")
+    ]
+    fake_confidence_note = "intentional_override: 12 held-out test examples, 0.833 recall."
+
+    with (
+        patch("ssmlint.classifier.apply_tier1_to_workbook", return_value=(tier1_surviving, tier1_suppressed)),
+        patch("ssmlint.classifier.describe_intentional_override_confidence", return_value=fake_confidence_note),
+        patch("ssmlint.llm_adjudicator.check_ollama_available"),
+        patch("ssmlint.llm_adjudicator.apply_tier2_to_workbook", return_value=(tier2_surviving, tier2_suppressed)),
+    ):
+        report = build_report(
+            fixtures_dir / "revenue_row_with_hardcode.xlsx",
+            tier1_checkpoint="fake/checkpoint",
+            tier2_model="qwen2.5:3b-instruct",
+        )
+
+    assert report.issues == []  # everything Tier 1 let through, Tier 2 then suppressed
+    assert [i.cell for i in report.suppressed_issues] == ["Model!B14", "Model!H14"]
+    by_cell = {i.cell: i.tier for i in report.suppressed_issues}
+    assert by_cell["Model!B14"] == "Tier 0 (suppressed by Tier 1)"
+    assert by_cell["Model!H14"] == "Tier 0 (suppressed by Tier 2)"
+    assert report.caveat == f"{REPORT_CAVEAT_TIER1} {fake_confidence_note} {REPORT_CAVEAT_TIER2}"
+
+
+def test_tier2_model_bad_server_fails_loudly_not_silently(fixtures_dir: Path) -> None:
+    tier1_surviving = [
+        Issue(cell="Model!H14", severity="high", rule_id="literal-in-formula-block", explanation="e", suggested_fix="f")
+    ]
+    with (
+        patch("ssmlint.classifier.apply_tier1_to_workbook", return_value=(tier1_surviving, [])),
+        patch("ssmlint.classifier.describe_intentional_override_confidence", return_value="note"),
+        patch("ssmlint.llm_adjudicator.check_ollama_available", side_effect=RuntimeError("Ollama not reachable")),
+    ):
+        try:
+            build_report(
+                fixtures_dir / "revenue_row_with_hardcode.xlsx",
+                tier1_checkpoint="fake/checkpoint",
+                tier2_model="qwen2.5:3b-instruct",
+            )
+            assert False, "expected RuntimeError"
+        except RuntimeError as exc:
+            assert "Tier 2 inference failed" in str(exc)
+            assert "qwen2.5:3b-instruct" in str(exc)
