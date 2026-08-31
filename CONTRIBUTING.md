@@ -79,15 +79,15 @@ Nine-stage pipeline, each stage consuming the previous stage's output:
 [6] Rule Engine (Tier 0) ────► deterministic checks, always on, $0         🟢
    │
    ▼
-[7] Trained Classifier (Tier 1, optional) ─► subtotal | intentional_override | 🔴
+[7] Trained Classifier (Tier 1, optional) ─► subtotal | intentional_override | 🟢
    │                            suspected_error | unknown
    │                            small encoder, CPU-only, trained on synthetic
    │                            corruption labels
    ▼
-[8] Local LLM Adjudicator (Tier 2, optional, flag-gated) ─► same 4-way label 🔴
+[8] Local LLM Adjudicator (Tier 2, optional, flag-gated) ─► same 4-way label 🟢
    │                            3B model via Ollama, grammar-constrained
    ▼
-[9] Report Builder ──────────► ranked JSON + standalone HTML                🟢 (Tier 0 only)
+[9] Report Builder ──────────► ranked JSON + standalone HTML                🟢 (Tier 0/1/2)
 ```
 
 **Design principle:** everything downstream of stage [2] consumes the AST, never raw formula strings or raw cell dumps. Any semantic layer (Tier 1 or Tier 2) sees a compact normalized block description, never a pasted sheet.
@@ -103,8 +103,8 @@ Nine-stage pipeline, each stage consuming the previous stage's output:
 | R1C1 normalization | hand-rolled | Core transformation of the project |
 | Graph | `networkx` | Cycle detection, topological ordering |
 | Clustering | R1C1 equality + `rapidfuzz` | Exact match covers most; fuzzy catches near-misses |
-| Semantic layer — Tier 1 (planned) | DeBERTa-v3-small / ModernBERT-base, fine-tuned on synthetic-corruption labels | CPU-only, ms/block, $0 |
-| Semantic layer — Tier 2 (planned, optional) | Local 3B model via Ollama (Qwen2.5-3B-Instruct or Phi-3-mini) | Fits in 16GB RAM; 7B+ excluded for latency reasons |
+| Semantic layer — Tier 1 | `distilbert-base-uncased`, fine-tuned on synthetic-corruption labels (see Week 5 -- DeBERTa-v3-small was the original plan, reversed after real testing) | CPU-only, ms/block, $0 |
+| Semantic layer — Tier 2 (optional) | Local 3B model via Ollama (`qwen2.5:3b-instruct`) | Fits in 16GB RAM; 7B+ excluded for latency reasons |
 | Report | Jinja2 → single-file HTML | Must open without a server |
 | Tests | `pytest` + generated fixture workbooks | Fixtures regenerated per session, not committed as binaries |
 
@@ -304,9 +304,9 @@ Tier 0+1 doesn't beat Tier 0 here — both score 1.000/1.000/1.000. This is a re
 
 | Task | Status | Detail |
 |---|:---:|---|
-| Local LLM adjudicator | 🔴 | Explicitly deferred, not started — see design note below. Tier 1/2 remain blocked on the Week 5 corpus-expansion prerequisite, which the user chose to defer in favor of shipping Tier 0's report/ablation deliverables first. |
-| Full ablation table | 🟢 | `src/ssmlint/ablation.py` + `scripts/run_ablation.py`. Micro-averages Week 4's per-rule precision/recall/precision@10 into one Tier-0 row (README's [Configuration, Precision, Recall, Precision@10, Cost, Median runtime/workbook] shape), plus new full-pipeline runtime instrumentation. Tier 0+1/0+1+2 rows structurally present, `status="not_yet_available"`, `cost="$0"` (an architectural fact, not a measurement). Real result: Tier 0 scores **1.000/1.000/1.000**, median 3.4ms/workbook. |
-| HTML report builder | 🟢 | `src/ssmlint/report.py` + `src/ssmlint/templates/report.html.jinja` + new `ssmlint report <path>` CLI subcommand. Runs the real Tier 0 pipeline against one workbook, ranks issues (severity desc + `(rule_id, cell)` tiebreak), builds a per-sheet heatmap (bounding box over flagged cells), and renders a single self-contained HTML file (client-side severity filtering, click-through from heatmap to issue rows) plus a parallel JSON output. Optional `--tier1-checkpoint` flag (2026-08-20) layers live Tier 1 inference on top — see the step-by-step log below. |
+| Local LLM adjudicator | 🟢 | `src/ssmlint/llm_adjudicator.py` — a real local 3B model (`qwen2.5:3b-instruct` via Ollama) reviewing Tier 1's own surviving issues as a second opinion, chained on top of Tier 1 (never standalone), grammar-constrained to the same 4-way label set. Built as the final wrap-up stage (2026-08-30/31) — see its own dedicated section below. |
+| Full ablation table | 🟢 | `src/ssmlint/ablation.py` + `scripts/run_ablation.py`. Micro-averages Week 4's per-rule precision/recall/precision@10 into one Tier-0 row (README's [Configuration, Precision, Recall, Precision@10, Cost, Median runtime/workbook] shape), plus full-pipeline runtime instrumentation. All three rows now real and measured: Tier 0 **1.000/1.000/1.000**; Tier 0+1 **1.000/1.000/1.000** on its held-out test split; Tier 0+1+2 **1.000/0.818/1.000** on the same split — see the Tier 2 section below for the real numbers and what that recall drop actually means. |
+| HTML report builder | 🟢 | `src/ssmlint/report.py` + `src/ssmlint/templates/report.html.jinja` + new `ssmlint report <path>` CLI subcommand. Runs the real Tier 0 pipeline against one workbook, ranks issues (severity desc + `(rule_id, cell)` tiebreak), builds a per-sheet heatmap (bounding box over flagged cells), and renders a single self-contained HTML file (client-side severity filtering, click-through from heatmap to issue rows) plus a parallel JSON output. Optional `--tier1-checkpoint` flag (2026-08-20) layers live Tier 1 inference on top; optional `--tier2-model` flag (2026-08-31) additionally layers live Tier 2 inference on top of Tier 1 — see the step-by-step logs below. |
 
 **Design note (2026-08-16): why the Local LLM row stays red.** This week's scope was explicitly confirmed with the user before implementation: build the ablation table and report builder on top of the already-working Tier 0 engine, and leave Tier 1 (blocked since Week 5 — the corpus can't yet support a real 4-way fine-tune) and Tier 2 (which depends on Tier 1 existing) deferred rather than started as a drive-by. Four judgment calls were surfaced and confirmed directly before any code was written (recorded in `diya.md`, the saved plan): add `jinja2` as a new dependency (yes — pure-Python, ~134KB wheel, one tiny transitive dep); wrap `Issue` in a new `RankedIssue` rather than widening the completed-stage `rules/base.py` (confirmed — zero risk to a finished stage, matches `evaluation.py`'s own `ScoredIssue` wrapper precedent); show `"$0"` cost on the two not-yet-built ablation rows since it's a stated architectural fact independent of measurement, while every genuinely-measured field on those rows stays `None`; and put the report command in `cli.py` as `ssmlint report` (not a `scripts/run_*.py` script) since it's a single-workbook, end-user-facing operation like `dump`, not corpus-facing dev tooling.
 
@@ -388,3 +388,60 @@ Block Model!I14:M14
 ```
 
 251 tests passing (up from 245).
+
+---
+
+## Local LLM Adjudicator (Tier 2) — the project wrap-up (2026-08-30/31)
+
+Stage [8] of the README's 9-stage architecture, the last one left unbuilt, given a hard limit on remaining time to work on this project. Planned via Claude Code's plan mode: the environment was investigated live *before* any code was written (not assumed) — Ollama 0.33.1 was already installed and running on this machine, and `qwen2.5:3b-instruct` (the exact model the README names) was already pulled. Two real chat calls were made against the actual running server with the intended JSON-schema `format` constraint before committing to this design, confirming it genuinely restricts output to the 4-way label set (never free text, never an invented cell address) and produced sensible real answers (a `growth_chain` block bordering a literal deviation → `intentional_override`; a `category_total` block with no deviations → `subtotal`). Real measured latency: ~37.7s cold (one-time model load), ~10.3s warm — matching the README's own "seconds/block — use sparingly" framing exactly, not aspirationally.
+
+**Design decisions, made directly rather than picked silently:**
+1. **stdlib `urllib.request`, no new pip dependency** — confirmed directly with the user (the only genuinely open judgment call in this plan; every other decision below followed directly from the README's own spec or this project's established conventions). Matches the project's existing minimal-dependency ethos.
+2. **Chained-only, never standalone** — `--tier2-model`/`tier2_model` requires `--tier1-checkpoint`/`tier1_checkpoint_dir` also being given, in both `ssmlint report` and `scripts/run_ablation.py`, raising a `ValueError` immediately otherwise. The README's own ablation table only ever shows "Tier 0", "Tier 0 + 1", "Tier 0 + 1 + 2" — never "Tier 0 + 2" — so this isn't an arbitrary restriction, it's what the spec actually describes: Tier 2 is a second opinion layered on Tier 1's own predictions, not an independent judge.
+3. **In-memory-only prediction cache, not persisted to disk** — a deliberate, time-boxed scope decision. `evaluate_tier0_plus_1_plus_2` mirrors Tier 1's own precedent of scoring only a checkpoint's held-out test split (21 entries here, not the full 144-entry corpus), keeping one full ablation run to a few minutes of real LLM calls even without persistence. Cross-run persistent caching is a real, explicitly deferred future scope — same honesty standard as Tier 1's own ablation row already stating "runtime not measured this pass" as a named gap, not a silent omission.
+
+**How it was solved.** `classifier.apply_tier1(issues, blocks, predictions)` turned out to already be completely label-string-agnostic — it only ever checks whether a predicted label is `"subtotal"`/`"intentional_override"`, with zero reference to which model produced it. This was confirmed by reading the function directly before writing any new suppression logic, and meant `classifier.py` needed **zero code changes** for this entire stage: `llm_adjudicator.apply_tier2_to_workbook` reuses `apply_tier1` verbatim. `classifier.serialize_block_example` (deterministic, ML-framework-free string formatting) is reused verbatim as the LLM's prompt body — exactly the README's own design principle that the same block representation feeds Tier 1 and Tier 2 interchangeably. The one new function that couldn't be reused, `evaluate_tier0_plus_1_plus_2`, lives in `llm_adjudicator.py` (not `classifier.py`) since it composes both modules' internals and this keeps the dependency direction one-way (`llm_adjudicator` depends on `classifier`, never the reverse). The README's own "cache by normalized block signature" requirement is implemented as a `sha256` hash of `serialize_block_example`'s output — the one shared text representation both tiers already use, never a second ad-hoc signature scheme.
+
+**Tests.** 20 new tests across `tests/test_llm_adjudicator.py` (new), `tests/test_ablation.py`, `tests/test_report.py`, and `tests/test_cli.py`. Nothing in the default `pytest` suite requires a real, running Ollama server — every test mocks the one real HTTP boundary (`llm_adjudicator._post_chat` for chat calls, `urllib.request.urlopen` for the `/api/tags` reachability check), confirmed directly by grepping the test suite for every reference to these names before considering this stage done: every single one is either the function under test or a `patch(...)` target, never a real unmocked call. This matters even more here than it did for Tier 1, since GitHub Actions CI cannot have a local Ollama process at all.
+
+**Bugs/defects encountered and fixed:** One, caught immediately by running the new tests rather than trusting hand-written test data: an early version of `test_predict_labels_llm_different_blocks_get_different_cache_keys` built two `Block`s that differed only in their `cells` list, but the local `_block()` test helper hardcodes `span`/`pattern` regardless of the cells passed in — so both blocks serialized to byte-identical text and shared one cache entry, exactly the opposite of what the test claimed to check. Fixed by giving the test helper a `span`/`row` override and using genuinely different spans for the two blocks — the test's own premise, not the cache logic, was wrong.
+
+**Real, live-measured ablation table** (`scripts/run_ablation.py --tier1-checkpoint models/tier1 --tier2-model qwen2.5:3b-instruct`, real Ollama calls, not mocked):
+
+```
+Configuration                      Precision    Recall  Precision@10    Cost   Median runtime/workbook
+Tier 0 (rules only)                    1.000     1.000         1.000      $0                   12.3 ms
+Tier 0 + 1 (+ trained classifier)      1.000     1.000         1.000      $0                       n/a
+Tier 0 + 1 + 2 (+ local LLM)           1.000     0.818         1.000      $0                       n/a
+
+[Tier 0 + 1 + 2 (+ local LLM)] Measured on the 21-entry held-out test split from models\tier1, using
+local LLM model 'qwen2.5:3b-instruct' via Ollama as a second opinion layered on top of Tier 1's own
+predictions (chained, not standalone). Tier 0+1 ALONE on this same test split (the fair comparison
+point): precision=1.0, recall=1.0. Tier 2 has NO held-out classification report of its own -- it is a
+zero-shot local LLM, never fine-tuned on this corpus, unlike Tier 1's own per-label report -- these
+ablation numbers are the only real evidence of its quality on this corpus.
+```
+
+**This is a real, honest, and genuinely different result from Tier 0+1's** (which matched Tier 0 exactly, since Tier 0 already scores perfectly on this test split and there was no headroom left to improve). Tier 2's recall dropped to **0.818** — the local LLM wrongly judged at least one real injected bug on the held-out test split to be a legitimate `subtotal`/`intentional_override`, suppressing a true positive and turning it into a false negative. Precision and precision@10 stayed perfect (Tier 2 never wrongly *un*-suppressed anything, and never introduced a new false positive), so the effect is asymmetric: a zero-shot 3B model reviewing already-rule-flagged issues trades some recall for no precision gain here, on this synthetic corpus. Reported exactly as measured — this is evidence the second-opinion layer has a real, non-zero effect (unlike Tier 1's own no-headroom result), just not a positive one on this particular corpus and this particular checkpoint's Tier 1 predictions.
+
+**Real single-workbook verification**, run against `tests/fixtures/revenue_row_with_hardcode.xlsx` with the real trained Tier 1 checkpoint AND the real running Ollama server (not mocked):
+
+```
+ssmlint report tests/fixtures/revenue_row_with_hardcode.xlsx --tier1-checkpoint models/tier1 --tier2-model qwen2.5:3b-instruct
+Wrote HTML report to revenue_row_with_hardcode.report.html (2 issue(s) found)
+```
+
+Both `H14` (the real hardcode bug) and `B14` (the growth-chain seed) survived all three tiers unsuppressed — identical to the Tier-0-only and Tier-0+1-only results already on record from the prior stage. Real JSON output confirms both issues tagged `"tier": "Tier 0 (Tier 1+2-reviewed)"`, `"suppressed_issues": []`, and the real combined caveat text ending with the new Tier 2 caveat:
+
+> "...Additionally, a local LLM adjudicator (a 3B-parameter model run via Ollama) reviewed Tier 1's own surviving issues as a second opinion -- never a standalone judge on its own, always layered on top of Tier 1. Its output is grammar-constrained... but unlike Tier 1 it is zero-shot -- never fine-tuned on this project's own corpus, and has no held-out classification report of its own..."
+
+274 tests passing (up from 251) across the full Tier 2 build.
+
+---
+
+## Project wrap-up (2026-08-31)
+
+All 9 stages of the README's architecture now exist end-to-end, each with real, measured evidence rather than an aspirational claim. Two things are deliberately left as known, documented limitations rather than fixed in this pass, given the hard time limit this wrap-up was scoped against:
+
+- **`intentional_override` (5 corpus examples, 1 held-out test example, 0.000 recall) and `unknown` (20 examples, still below the 50-per-class readiness floor)** remain thin, exactly as documented in Week 5's corpus-expansion follow-up. Meaningfully closing this gap would need new corpus injection mechanisms and a retrain — a real, scoped task of its own, not attempted here.
+- **README's "Stretch" section** (VS Code/Excel add-in, diff mode, Google Sheets support, Intel GPU acceleration, house-convention learning, an optional hosted-frontier-model tier) remains explicitly out of scope — none of it is part of the Build Plan's core 9 stages.
