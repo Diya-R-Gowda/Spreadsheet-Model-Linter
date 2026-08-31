@@ -8,11 +8,9 @@ Runs entirely offline, on commodity hardware, at zero cost — no API keys, no c
 
 ## Status
 
-**Week 1 (parsing spine) is done.** The workbook parser and `ssmlint dump` CLI exist and are tested.
+**All 9 stages of the architecture below exist end-to-end.** This section is a snapshot, not the live source of truth — **start with [CONTRIBUTING.md](CONTRIBUTING.md)** for the real, currently-accurate week-by-week build log, real measured numbers, and honestly-documented limitations; this file sells the idea, that one tells you where the code actually stands.
 
-**Formula tokenizer/AST (stage [2]) is done.** `src/ssmlint/tokenizer.py` and `src/ssmlint/formula_parser.py` turn a raw formula string into a structured AST — hand-rolled, no third-party formula-parsing library — with correct operator precedence (including Excel's unary-minus-before-`^` quirk), $-anchoring per axis, cross-sheet references, and named ranges. It's standalone: not yet wired into `parser.py`. Formula shapes outside the v1 whitelist (array formulas, `LET`/`LAMBDA`, structured table references, full-column/full-row and 3-D ranges, the percent operator) raise `UnsupportedFormulaError` rather than crashing or mis-parsing.
-
-Everything past that — R1C1 normalization, dependency graph, block detection, rule engine, semantic layer — is not built yet.
+In short: the parser, formula AST, R1C1 normalizer, dependency graph, block detector, and Tier 0 rule engine (stages 1-6) are done and tested, with a real synthetic-corruption corpus backing a real Tier 0 evaluation (`ssmlint report`, `scripts/run_evaluation.py`). Tier 1 (stage 7) is a real trained classifier (`distilbert-base-uncased`, `scripts/train_classifier.py`) — strong on 2 of its 4 labels, honestly thin on the other 2 (`intentional_override`, `unknown`), a known and documented corpus-volume limitation, not a bug. Tier 2 (stage 8) is a real local LLM adjudicator — a 3B model (Qwen2.5-3B-Instruct) run via Ollama, grammar-constrained to the same 4-way label set, layered on top of Tier 1 as a second opinion; it is zero-shot, never fine-tuned on this project's corpus. The report builder (stage 9, `ssmlint report`) ties all three tiers together into one ranked JSON/HTML report, and the full ablation table (`scripts/run_ablation.py`) has real, measured numbers for all three configurations.
 
 ## Usage
 
