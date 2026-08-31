@@ -105,3 +105,38 @@ def test_report_tier1_checkpoint_flag_reports_suppressed_count(fixtures_dir: Pat
     data = json.loads(json_path.read_text(encoding="utf-8"))
     assert data["suppressed_issues"]
     assert data["suppressed_issues"][0]["cell"] == "Model!B14"
+
+
+def test_report_tier2_model_flag_wires_through_to_build_report(fixtures_dir: Path, tmp_path: Path, capsys) -> None:
+    html_path = tmp_path / "out.report.html"
+    json_path = tmp_path / "out.report.json"
+    tier1_surviving = [Issue(cell="Model!H14", severity="high", rule_id="literal-in-formula-block",
+                              explanation="e", suggested_fix="f")]
+    tier2_suppressed = [Issue(cell="Model!H14", severity="high", rule_id="literal-in-formula-block",
+                               explanation="e", suggested_fix="f")]
+
+    with (
+        patch("ssmlint.classifier.apply_tier1_to_workbook", return_value=(tier1_surviving, [])),
+        patch("ssmlint.classifier.describe_intentional_override_confidence", return_value="note"),
+        patch("ssmlint.llm_adjudicator.check_ollama_available"),
+        patch("ssmlint.llm_adjudicator.apply_tier2_to_workbook", return_value=([], tier2_suppressed)),
+    ):
+        exit_code = main(
+            [
+                "report",
+                str(fixtures_dir / "revenue_row_with_hardcode.xlsx"),
+                "--html", str(html_path),
+                "--json", str(json_path),
+                "--tier1-checkpoint", "fake/checkpoint",
+                "--tier2-model", "qwen2.5:3b-instruct",
+                "--tier2-endpoint", "http://custom:9999",
+            ]
+        )
+    assert exit_code == 0
+
+    stdout = capsys.readouterr().out
+    assert "1 suppressed by Tier 1" in stdout  # 1 total suppressed issue (from Tier 2 in this case)
+
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    assert data["suppressed_issues"][0]["cell"] == "Model!H14"
+    assert data["suppressed_issues"][0]["tier"] == "Tier 0 (suppressed by Tier 2)"
