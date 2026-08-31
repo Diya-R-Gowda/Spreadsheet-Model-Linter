@@ -87,6 +87,12 @@ _NO_CHECKPOINT_NOTE = (
     "this row in. A real trained checkpoint now exists (see CONTRIBUTING.md); this row is "
     "just not wired up unless the flag is actually passed."
 )
+_NO_TIER2_NOTE = (
+    "Not measured this run -- pass tier2_model (scripts/run_ablation.py's --tier2-model flag, "
+    "e.g. 'qwen2.5:3b-instruct') together with tier1_checkpoint_dir to fill this row in. A real "
+    "local Ollama adjudicator now exists (see CONTRIBUTING.md); this row is just not wired up "
+    "unless the flag is actually passed."
+)
 
 
 @dataclass(frozen=True)
@@ -171,7 +177,11 @@ def _time_full_pipeline_per_entry(corpus_dir: Path, rules: dict) -> list[float]:
 
 
 def build_ablation_table(
-    corpus_dir: Path, rules: dict | None = None, tier1_checkpoint_dir: Path | None = None
+    corpus_dir: Path,
+    rules: dict | None = None,
+    tier1_checkpoint_dir: Path | None = None,
+    tier2_model: str | None = None,
+    tier2_endpoint: str | None = None,
 ) -> AblationTable:
     """`tier1_checkpoint_dir`, when given (a real checkpoint saved by
     `scripts/train_classifier.py`), fills in the Tier 0+1 row for real:
@@ -182,7 +192,24 @@ def build_ablation_table(
     larger, and not directly comparable number). Omitting the parameter
     (the default) preserves the exact prior behavior -- every existing
     caller/test is unaffected.
+
+    `tier2_model`, when ALSO given (e.g. "qwen2.5:3b-instruct", a real
+    local Ollama model), fills in the Tier 0+1+2 row for real via
+    `llm_adjudicator.evaluate_tier0_plus_1_plus_2`. Chained-only, matching
+    the README's own ablation table shape (it only ever shows "Tier 0",
+    "Tier 0 + 1", "Tier 0 + 1 + 2" -- never "Tier 0 + 2"): passing
+    `tier2_model` without `tier1_checkpoint_dir` raises `ValueError`
+    immediately, before any real work runs, rather than doing something
+    the README never describes.
     """
+    if tier2_model is not None and tier1_checkpoint_dir is None:
+        raise ValueError(
+            "tier2_model requires tier1_checkpoint_dir to also be given -- Tier 2 is a second "
+            "opinion layered on top of Tier 1's own predictions, never a standalone alternative "
+            "(matches the README's own ablation table, which only ever shows 'Tier 0 + 1 + 2', "
+            "never 'Tier 0 + 2')."
+        )
+
     rules = rules if rules is not None else evaluation.DEFAULT_RULES
     report = evaluation.run_evaluation(corpus_dir, rules=rules)
     precision, recall, precision_at_10 = _aggregate_tier0_metrics(report.rollups)
@@ -229,6 +256,49 @@ def build_ablation_table(
                 f"{intentional_override_note}"
             ),
         )
+
+        if tier2_model is not None:
+            from . import llm_adjudicator
+
+            endpoint = tier2_endpoint if tier2_endpoint is not None else llm_adjudicator.DEFAULT_OLLAMA_ENDPOINT
+            tier012_rollups, tier2_test_entries = llm_adjudicator.evaluate_tier0_plus_1_plus_2(
+                corpus_dir, tier1_checkpoint_dir, tier2_model=tier2_model, tier2_endpoint=endpoint, rules=rules
+            )
+            tier012_precision, tier012_recall, tier012_precision_at_10 = _aggregate_tier0_metrics(tier012_rollups)
+
+            tier012_row = AblationRow(
+                configuration=TIER_0_1_2_LABEL,
+                status="measured",
+                precision=tier012_precision,
+                recall=tier012_recall,
+                precision_at_10=tier012_precision_at_10,
+                cost=_ARCHITECTURAL_COST,
+                # LLM inference latency not measured this pass -- a real, stated gap, same
+                # honesty standard as the Tier 0+1 row's own median_runtime_ms=None above.
+                median_runtime_ms=None,
+                notes=(
+                    f"Measured on the {len(tier2_test_entries)}-entry held-out test split from "
+                    f"{tier1_checkpoint_dir}, using local LLM model '{tier2_model}' via Ollama as a second "
+                    f"opinion layered on top of Tier 1's own predictions (chained, not standalone -- see "
+                    f"module docstring). Tier 0+1 ALONE on this same test split (the fair comparison point, "
+                    f"not the full-corpus row above): precision={tier01_precision if tier01_precision is not None else 'n/a'}, "
+                    f"recall={tier01_recall if tier01_recall is not None else 'n/a'}. Tier 2 has NO held-out "
+                    "classification report of its own -- it is a zero-shot local LLM, never fine-tuned on "
+                    "this corpus, unlike Tier 1's own per-label report -- these ablation numbers are the "
+                    "only real evidence of its quality on this corpus."
+                ),
+            )
+        else:
+            tier012_row = AblationRow(
+                configuration=TIER_0_1_2_LABEL,
+                status="not_yet_available",
+                precision=None,
+                recall=None,
+                precision_at_10=None,
+                cost=_ARCHITECTURAL_COST,
+                median_runtime_ms=None,
+                notes=_NO_TIER2_NOTE,
+            )
     else:
         tier01_row = AblationRow(
             configuration=TIER_0_1_LABEL,
@@ -240,17 +310,17 @@ def build_ablation_table(
             median_runtime_ms=None,
             notes=_NO_CHECKPOINT_NOTE,
         )
-
-    tier012_row = AblationRow(
-        configuration=TIER_0_1_2_LABEL,
-        status="not_yet_available",
-        precision=None,
-        recall=None,
-        precision_at_10=None,
-        cost=_ARCHITECTURAL_COST,
-        median_runtime_ms=None,
-        notes="Not started -- depends on Tier 1 above; Local LLM (Tier 2) adjudicator is unbuilt.",
-    )
+        tier012_row = AblationRow(
+            configuration=TIER_0_1_2_LABEL,
+            status="not_yet_available",
+            precision=None,
+            recall=None,
+            precision_at_10=None,
+            cost=_ARCHITECTURAL_COST,
+            median_runtime_ms=None,
+            notes="Not measured this run -- requires tier1_checkpoint_dir AND tier2_model both given (Tier 2 "
+            "is chained on top of Tier 1, never a standalone alternative).",
+        )
 
     return AblationTable(rows=[tier0_row, tier01_row, tier012_row])
 

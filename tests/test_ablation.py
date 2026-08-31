@@ -219,3 +219,71 @@ def test_tier1_checkpoint_dir_given_includes_the_intentional_override_confidence
 
     text = format_ablation_table_text(table)
     assert caveat_text in text
+
+
+# ---------------------------------------------------------------------------
+# tier2_model wiring -- mocked (no real Ollama server needed; a real live run
+# is documented separately in CONTRIBUTING.md with real pasted output)
+# ---------------------------------------------------------------------------
+
+
+def test_tier2_model_none_preserves_existing_not_yet_available_behavior() -> None:
+    """Omitting the parameter (every existing caller/test) must reproduce
+    today's exact behavior -- a real regression guard on the new
+    optional parameter's default."""
+    # tier1_checkpoint_dir given WITHOUT tier2_model -- must still be a placeholder Tier 0+1+2 row
+    fake_rollups = [
+        RuleRollup(rule_id="literal-in-formula-block", tp=1, fp=0, fn=0, precision_at_10=1.0, precision_at_10_k=1),
+    ]
+    fake_test_entries = ["literal_in_block__edge_left__n4"]
+    with patch("ssmlint.classifier.evaluate_tier0_plus_1", return_value=(fake_rollups, fake_test_entries)):
+        table = build_ablation_table(CORPUS_DIR, tier1_checkpoint_dir=Path("fake/checkpoint"))
+
+    tier012 = next(r for r in table.rows if r.configuration == TIER_0_1_2_LABEL)
+    assert tier012.status == "not_yet_available"
+    assert tier012.precision is None
+
+
+def test_tier2_model_given_without_tier1_checkpoint_dir_raises() -> None:
+    """Chained-only design: Tier 2 layers on top of Tier 1's own
+    predictions, never a standalone alternative -- matches the README's
+    own ablation table, which only ever shows 'Tier 0 + 1 + 2'."""
+    try:
+        build_ablation_table(CORPUS_DIR, tier2_model="qwen2.5:3b-instruct")
+        assert False, "expected ValueError"
+    except ValueError as exc:
+        assert "tier1_checkpoint_dir" in str(exc)
+
+
+def test_tier2_model_given_produces_a_measured_row_with_fair_comparison_notes() -> None:
+    fake_tier1_rollups = [
+        RuleRollup(rule_id="literal-in-formula-block", tp=1, fp=0, fn=0, precision_at_10=1.0, precision_at_10_k=1),
+    ]
+    fake_tier2_rollups = [
+        RuleRollup(rule_id="literal-in-formula-block", tp=1, fp=0, fn=0, precision_at_10=1.0, precision_at_10_k=1),
+    ]
+    fake_test_entries = ["literal_in_block__edge_left__n4"]
+
+    with (
+        patch("ssmlint.classifier.evaluate_tier0_plus_1", return_value=(fake_tier1_rollups, fake_test_entries)),
+        patch(
+            "ssmlint.llm_adjudicator.evaluate_tier0_plus_1_plus_2",
+            return_value=(fake_tier2_rollups, fake_test_entries),
+        ),
+    ):
+        table = build_ablation_table(
+            CORPUS_DIR, tier1_checkpoint_dir=Path("fake/checkpoint"), tier2_model="qwen2.5:3b-instruct"
+        )
+
+    tier012 = next(r for r in table.rows if r.configuration == TIER_0_1_2_LABEL)
+    assert tier012.status == "measured"
+    assert tier012.precision == 1.0
+    assert tier012.recall == 1.0
+    assert "1-entry held-out test split" in tier012.notes
+    assert "qwen2.5:3b-instruct" in tier012.notes
+    assert "Tier 0+1 ALONE on this same test split" in tier012.notes
+    assert "zero-shot local LLM" in tier012.notes
+
+    text = format_ablation_table_text(table)
+    assert "[Tier 0 + 1 + 2 (+ local LLM)]" in text
+    assert "qwen2.5:3b-instruct" in text
